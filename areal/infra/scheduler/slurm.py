@@ -47,6 +47,7 @@ from areal.infra.utils.slurm import (
 )
 from areal.utils import logging, name_resolve, names
 from areal.utils.fs import validate_shared_path
+from areal.utils.network import format_hostport, split_hostport
 from areal.utils.offload import get_tms_env_vars
 
 logger = logging.getLogger("SlurmScheduler")
@@ -272,7 +273,7 @@ class SlurmScheduler(Scheduler):
             return False
 
         port = int(worker_info.worker.worker_ports[0])
-        url = f"http://{worker_info.worker.ip}:{port}/health"
+        url = f"http://{format_hostport(worker_info.worker.ip, port)}/health"
 
         try:
             response = requests.get(url, timeout=2.0)
@@ -282,12 +283,16 @@ class SlurmScheduler(Scheduler):
 
     def _configure_worker(self, worker_info: SlurmWorkerInfo, worker_rank: int) -> None:
         # Wait for worker to be ready
+        timeout = self.startup_timeout
+        start_time = time.time()
         while not self._is_worker_ready(worker_info):
+            if time.time() - start_time > timeout:
+                raise WorkerTimeoutError(worker_info.role, timeout)
             time.sleep(0.1)
 
         worker_id = worker_info.worker.id
         port = int(worker_info.worker.worker_ports[0])
-        url = f"http://{worker_info.worker.ip}:{port}/configure"
+        url = f"http://{format_hostport(worker_info.worker.ip, port)}/configure"
 
         try:
             response = requests.post(
@@ -354,11 +359,11 @@ class SlurmScheduler(Scheduler):
                 addr = name_resolve.get(key)
             except name_resolve.NameEntryNotFoundError:
                 continue
-            ip, ports_str = addr.split(":")
+            ip, port = split_hostport(addr)
             worker_info.worker.ip = ip
-            worker_info.discovered = True
-            worker_ports = [ports_str]
+            worker_ports = [str(port)]
             worker_info.worker.worker_ports = worker_ports
+            worker_info.discovered = True
 
             self._wait_worker_ready(worker_info)
 

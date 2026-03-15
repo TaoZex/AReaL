@@ -1,5 +1,6 @@
 import random
 import socket
+from ipaddress import ip_address
 
 
 def gethostname():
@@ -35,7 +36,66 @@ def gethostip(probe_host: str = "8.8.8.8", probe_port: int = 80) -> str:
             sock.connect((probe_host, probe_port))
             return sock.getsockname()[0]
     except OSError as e:
-        raise RuntimeError("Could not determine host IP") from e
+        try:
+            with socket.socket(socket.AF_INET6, socket.SOCK_DGRAM) as sock:
+                sock.connect(("2001:4860:4860::8888", probe_port))
+                ip6 = sock.getsockname()[0]
+                if ip6 and ip6 != "::1":
+                    return ip6
+        except OSError:
+            raise RuntimeError("Could not determine host IP") from e
+
+
+def get_loopback_ip() -> str:
+    try:
+        with socket.socket(socket.AF_INET, socket.SOCK_STREAM) as sock:
+            sock.bind(("127.0.0.1", 0))
+        return "127.0.0.1"
+    except OSError:
+        pass
+    if socket.has_ipv6:
+        try:
+            with socket.socket(socket.AF_INET6, socket.SOCK_STREAM) as sock:
+                sock.bind(("::1", 0))
+            return "::1"
+        except OSError:
+            pass
+    raise RuntimeError("Could not determine loopback IP")
+
+
+def format_host_for_url(host: str) -> str:
+    if host.startswith("[") and host.endswith("]"):
+        return host
+    if ":" in host:
+        return f"[{host}]"
+    return host
+
+
+def format_hostport(host: str, port: int) -> str:
+    return f"{format_host_for_url(host)}:{port}"
+
+
+def split_hostport(addr: str) -> tuple[str, int]:
+    if addr.startswith("["):
+        end = addr.find("]")
+        if end == -1:
+            raise ValueError(f"Invalid bracketed address: {addr}")
+        host = addr[1:end]
+        rest = addr[end + 1 :]
+        if not rest.startswith(":"):
+            raise ValueError(f"Invalid bracketed address: {addr}")
+        return host, int(rest[1:])
+
+    if addr.count(":") == 1:
+        host, port_s = addr.split(":", 1)
+        return host, int(port_s)
+
+    host, port_s = addr.rsplit(":", 1)
+    try:
+        ip_address(host)
+    except ValueError as e:
+        raise ValueError(f"Invalid host:port address: {addr}") from e
+    return host, int(port_s)
 
 
 def find_free_ports(
