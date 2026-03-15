@@ -25,9 +25,17 @@ def gethostip(probe_host: str = "8.8.8.8", probe_port: int = 80) -> str:
         RuntimeError: If no suitable IPv4 address can be determined
     """
     try:
-        ip = socket.gethostbyname(socket.gethostname())
-        if ip and not ip.startswith("127."):
-            return ip
+        hostname = socket.gethostname()
+        infos = socket.getaddrinfo(hostname, None, socket.AF_UNSPEC, socket.SOCK_DGRAM)
+        for family, _, _, _, sockaddr in infos:
+            if family == socket.AF_INET:
+                ip = sockaddr[0]
+                if ip and not ip.startswith("127."):
+                    return ip
+            elif family == socket.AF_INET6:
+                ip = sockaddr[0]
+                if ip and ip != "::1":
+                    return ip
     except socket.gaierror:
         pass
 
