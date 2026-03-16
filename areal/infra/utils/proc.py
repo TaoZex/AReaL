@@ -6,10 +6,14 @@ import signal
 import subprocess
 import sys
 import threading
+import time
 from pathlib import Path
 from typing import TYPE_CHECKING
 
-import psutil
+try:
+    import psutil
+except Exception:
+    psutil = None
 
 from areal.utils import logging
 from areal.utils.logging import LOG_PREFIX_WIDTH
@@ -121,6 +125,7 @@ def run_with_streaming_logs(
         shell_cmd,
         shell=True,
         executable="/bin/bash",
+        preexec_fn=os.setsid,
         env=env,
         stdout=stdout or sys.stdout,
         stderr=stdout or sys.stdout,
@@ -144,11 +149,23 @@ def kill_process_tree(
         include_parent = False
 
     # Get process tree
+    if psutil is None:
+        _kill_process_tree_fallback(
+            parent_pid=parent_pid, timeout=timeout, include_parent=include_parent, graceful=graceful
+        )
+        return
+
+    sys.modules.setdefault("psutil", psutil)
     try:
         parent = psutil.Process(parent_pid)
         children = parent.children(recursive=True)
     except psutil.NoSuchProcess:
         logger.info(f"Process {parent_pid} already terminated")
+        return
+    except Exception:
+        _kill_process_tree_fallback(
+            parent_pid=parent_pid, timeout=timeout, include_parent=include_parent, graceful=graceful
+        )
         return
 
     # Filter skip_pid from children
@@ -217,3 +234,54 @@ def kill_process_tree(
                 parent.send_signal(signal.SIGQUIT)
             except psutil.NoSuchProcess:
                 pass
+
+
+def _kill_process_tree_fallback(
+    *, parent_pid: int, timeout: int, include_parent: bool, graceful: bool
+) -> None:
+    try:
+        pgid = os.getpgid(parent_pid)
+    except Exception:
+        pgid = None
+
+    if graceful:
+        if pgid is not None:
+            try:
+                os.killpg(pgid, signal.SIGTERM)
+            except ProcessLookupError:
+                return
+        elif include_parent:
+            try:
+                os.kill(parent_pid, signal.SIGTERM)
+            except ProcessLookupError:
+                return
+        for _ in range(max(1, timeout * 10)):
+            try:
+                os.kill(parent_pid, 0)
+            except ProcessLookupError:
+                return
+            except PermissionError:
+                break
+            time.sleep(0.1)
+        if pgid is not None:
+            try:
+                os.killpg(pgid, signal.SIGKILL)
+            except ProcessLookupError:
+                return
+        elif include_parent:
+            try:
+                os.kill(parent_pid, signal.SIGKILL)
+            except ProcessLookupError:
+                return
+        return
+
+    if pgid is not None:
+        try:
+            os.killpg(pgid, signal.SIGKILL)
+        except ProcessLookupError:
+            return
+    elif include_parent:
+        try:
+            os.kill(parent_pid, signal.SIGKILL)
+        except ProcessLookupError:
+            return

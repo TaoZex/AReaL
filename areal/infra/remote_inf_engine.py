@@ -47,7 +47,7 @@ from areal.infra.utils.proc import kill_process_tree
 from areal.utils import logging, name_resolve, names
 from areal.utils.data import concat_padded_tensors
 from areal.utils.dynamic_import import import_from_string
-from areal.utils.network import find_free_ports, gethostip
+from areal.utils.network import find_free_ports, format_hostport, gethostip, split_hostport
 from areal.utils.perf_tracer import trace_perf
 
 from .workflow_executor import WorkflowExecutor
@@ -359,7 +359,11 @@ class RemoteInfEngine(InferenceEngine):
 
     def _wait_for_server(self, address):
         """Wait for a server to become healthy."""
-        base_url = f"http://{address}"
+        try:
+            host, port = split_hostport(address)
+            base_url = f"http://{format_hostport(host, port)}"
+        except ValueError:
+            base_url = f"http://{address}"
         tik = time.time()
         while time.time() - tik < self.config.setup_timeout:
             if self.check_health(base_url):
@@ -408,7 +412,9 @@ class RemoteInfEngine(InferenceEngine):
             self.addresses = addr if isinstance(addr, list) else [addr]
             self.logger.info("Get server addresses from the `addr` argument.")
         elif len(self.local_server_processes) > 0:
-            self.addresses = [f"{s.host}:{s.port}" for s in self.local_server_processes]
+            self.addresses = [
+                format_hostport(s.host, s.port) for s in self.local_server_processes
+            ]
             self.logger.info("Get server addresses from the local subprocess.")
         elif (
             self.config.experiment_name is not None
@@ -1234,12 +1240,14 @@ class RemoteInfEngine(InferenceEngine):
 
     def launch_server(self, server_args: dict[str, Any]) -> LocalInfServerInfo:
         """Launch a local inference server."""
-        server_args["host"] = gethostip()
+        advertise_host = gethostip()
+        if "host" not in server_args:
+            server_args["host"] = "::" if ":" in advertise_host else "0.0.0.0"
         server_args["port"] = find_free_ports(1)[0]
         process = self.backend.launch_server(server_args)
-        address = f"{server_args['host']}:{server_args['port']}"
+        address = format_hostport(advertise_host, server_args["port"])
         server_info = LocalInfServerInfo(
-            host=server_args["host"],
+            host=advertise_host,
             port=server_args["port"],
             process=process,
         )
@@ -1249,7 +1257,7 @@ class RemoteInfEngine(InferenceEngine):
             if ray.is_initialized():
                 # do not return with process for ray as it is not picklable
                 return LocalInfServerInfo(
-                    host=server_args["host"],
+                    host=advertise_host,
                     port=server_args["port"],
                     process=None,
                 )
@@ -1262,7 +1270,7 @@ class RemoteInfEngine(InferenceEngine):
             raise
 
     def _shutdown_one_server(self, server_info: LocalInfServerInfo):
-        addr = f"{server_info.host}:{server_info.port}"
+        addr = format_hostport(server_info.host, server_info.port)
         if addr in self.addresses:
             self.addresses.remove(addr)
         if server_info.process.poll() is not None:
