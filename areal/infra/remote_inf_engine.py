@@ -47,7 +47,12 @@ from areal.infra.utils.proc import kill_process_tree
 from areal.utils import logging, name_resolve, names
 from areal.utils.data import concat_padded_tensors
 from areal.utils.dynamic_import import import_from_string
-from areal.utils.network import find_free_ports, format_hostport, gethostip, split_hostport
+from areal.utils.network import (
+    find_free_ports,
+    format_hostport,
+    get_loopback_ip,
+    split_hostport,
+)
 from areal.utils.perf_tracer import trace_perf
 
 from .workflow_executor import WorkflowExecutor
@@ -357,7 +362,7 @@ class RemoteInfEngine(InferenceEngine):
         self._proxy_gateway_addr: str | None = None
         self.local_server_processes: list[LocalInfServerInfo] = []
 
-    def _wait_for_server(self, address):
+    def _wait_for_server(self, address: str, process: subprocess.Popen | None = None):
         """Wait for a server to become healthy."""
         try:
             host, port = split_hostport(address)
@@ -366,6 +371,10 @@ class RemoteInfEngine(InferenceEngine):
             base_url = f"http://{address}"
         tik = time.time()
         while time.time() - tik < self.config.setup_timeout:
+            if process is not None and process.poll() is not None:
+                raise TimeoutError(
+                    f"server launch failed (process exited with code {process.returncode})"
+                )
             if self.check_health(base_url):
                 return
             time.sleep(1)
@@ -1242,24 +1251,23 @@ class RemoteInfEngine(InferenceEngine):
 
     def launch_server(self, server_args: dict[str, Any]) -> LocalInfServerInfo:
         """Launch a local inference server."""
-        advertise_host = gethostip()
         if "host" not in server_args:
-            server_args["host"] = "::" if ":" in advertise_host else "0.0.0.0"
+            server_args["host"] = get_loopback_ip()
         server_args["port"] = find_free_ports(1)[0]
         process = self.backend.launch_server(server_args)
-        address = format_hostport(advertise_host, server_args["port"])
+        address = format_hostport(server_args["host"], server_args["port"])
         server_info = LocalInfServerInfo(
-            host=advertise_host,
+            host=server_args["host"],
             port=server_args["port"],
             process=process,
         )
         try:
-            self._wait_for_server(address)
+            self._wait_for_server(address, process=process)
             self.local_server_processes.append(server_info)
             if ray.is_initialized():
                 # do not return with process for ray as it is not picklable
                 return LocalInfServerInfo(
-                    host=advertise_host,
+                    host=server_args["host"],
                     port=server_args["port"],
                     process=None,
                 )

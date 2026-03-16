@@ -1,8 +1,6 @@
 import pytest
 
 pytest.importorskip("aiohttp")
-pytest.importorskip("ray")
-pytest.importorskip("torch")
 
 from areal.api.cli_args import InferenceEngineConfig
 from areal.infra.remote_inf_engine import RemoteInfEngine
