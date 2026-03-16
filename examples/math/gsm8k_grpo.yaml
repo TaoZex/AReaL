@@ -168,8 +168,8 @@ stats_logger:
     
   wandb:
     mode: "online"  # "online"、"offline" 或 "disabled"
-    project: "my-project"
-    entity: "my-team"
+    project: "my-awesome-project"
+    entity: "2633363995-personal"
 
   tensorboard:
     path: "/path/to/tensorboard/logs"  # null 禁用
