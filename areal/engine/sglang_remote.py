@@ -233,6 +233,17 @@ class SGLangBackend:
         """Launch SGLang server subprocess."""
         cmd = SGLangConfig.build_cmd_from_args(server_args)
         _env = os.environ.copy()
+        for k in (
+            "HTTP_PROXY",
+            "http_proxy",
+            "HTTPS_PROXY",
+            "https_proxy",
+            "ALL_PROXY",
+            "all_proxy",
+        ):
+            _env.pop(k, None)
+        _env["NO_PROXY"] = "*"
+        _env["no_proxy"] = "*"
         triton_cache_path = _env.get("TRITON_CACHE_PATH", TRITON_CACHE_PATH)
         _env["TRITON_CACHE_PATH"] = os.path.join(triton_cache_path, str(uuid.uuid4()))
 
