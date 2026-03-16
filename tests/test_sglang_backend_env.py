@@ -35,7 +35,9 @@ def test_sglang_backend_launch_server_disables_proxy_env(monkeypatch):
     backend.launch_server(server_args)
 
     env = captured["env"]
-    assert "HTTP_PROXY" not in env
-    assert "HTTPS_PROXY" not in env
-    assert env.get("NO_PROXY") == "*"
-    assert env.get("no_proxy") == "*"
+    assert env.get("HTTP_PROXY") == "http://proxy.invalid:8080"
+    assert env.get("HTTPS_PROXY") == "http://proxy.invalid:8080"
+    no_proxy = env.get("NO_PROXY") or ""
+    assert "localhost" in no_proxy
+    assert "127.0.0.1" in no_proxy
+    assert "::1" in no_proxy
