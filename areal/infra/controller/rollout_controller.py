@@ -38,7 +38,7 @@ from areal.infra.utils.concurrent import run_async_task
 from areal.utils import logging, perf_tracer
 from areal.utils.data import concat_padded_tensors, cycle_dataloader
 from areal.utils.dynamic_import import import_from_string
-from areal.utils.network import find_free_ports, gethostip
+from areal.utils.network import find_free_ports, format_hostport, gethostip
 from areal.utils.perf_tracer import trace_perf
 
 from ..staleness_manager import StalenessManager
@@ -614,7 +614,7 @@ class RolloutController:
             # Signal that the loop is ready
             self._callback_loop_ready.set()
             logger.info(
-                f"Callback server started on {self._callback_host}:{self._callback_port}"
+                f"Callback server started on {format_hostport(self._callback_host, self._callback_port)}"
             )
             self._callback_server.serve_forever()
 
@@ -645,7 +645,7 @@ class RolloutController:
         """Return callback server address as 'host:port'."""
         if self._callback_host is None or self._callback_port is None:
             raise RuntimeError("Callback server not started")
-        return f"{self._callback_host}:{self._callback_port}"
+        return format_hostport(self._callback_host, self._callback_port)
 
     def _resolve_task_future(self, task_id: int):
         """Resolve a pending future with the task result."""
