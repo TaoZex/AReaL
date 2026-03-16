@@ -14,7 +14,7 @@ cluster:
     type: nfs
     nfs_record_root: /tmp/areal/name_resolve
 
-allocation_mode: sglang:d4p1t1+megatron:d4p1t1
+allocation_mode: sglang:d2p1t2+megatron:d2p1t2
 
 scheduler:
   type: null
@@ -164,7 +164,7 @@ stats_logger:
   experiment_name: ${experiment_name}
   trial_name: ${trial_name}
   fileroot: ${cluster.fileroot}
-  
+
   wandb:
     mode: "online"  # "online"、"offline" 或 "disabled"
     project: "my-awesome-project"
