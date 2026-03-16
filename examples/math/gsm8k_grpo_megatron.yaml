@@ -164,8 +164,14 @@ stats_logger:
   experiment_name: ${experiment_name}
   trial_name: ${trial_name}
   fileroot: ${cluster.fileroot}
+  
   wandb:
-    mode: disabled
+    mode: "online"  # "online"、"offline" 或 "disabled"
+    project: "my-awesome-project"
+    entity: "2633363995-personal"
+
+  tensorboard:
+    path: "/path/to/tensorboard/logs"  # null 禁用
 
 perf_tracer:
   experiment_name: ${experiment_name}
