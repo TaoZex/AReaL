@@ -167,12 +167,12 @@ stats_logger:
   fileroot: ${cluster.fileroot}
     
   wandb:
-    mode: "online"  # "online"、"offline" 或 "disabled"
+    mode: "offline"  # "online"、"offline" 或 "disabled"
     project: "my-project"
     entity: "my-team"
 
   swanlab:
-    mode: "online"  # "online"、"local" 或 "disabled"
+    mode: "local"  # "online"、"local" 或 "disabled"
     project: "my-project"
 
   tensorboard:
