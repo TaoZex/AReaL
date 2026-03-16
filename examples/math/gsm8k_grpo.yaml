@@ -167,7 +167,7 @@ stats_logger:
   fileroot: ${cluster.fileroot}
     
   wandb:
-    mode: "offline"  # "online"、"offline" 或 "disabled"
+    mode: "online"  # "online"、"offline" 或 "disabled"
     project: "my-project"
     entity: "my-team"
 
