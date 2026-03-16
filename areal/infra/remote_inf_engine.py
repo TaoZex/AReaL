@@ -922,6 +922,16 @@ class RemoteInfEngine(InferenceEngine):
         )
 
         def callback(fut):
+            if fut.cancelled():
+                return
+            if fut.exception() is not None:
+                self.logger.error(
+                    "Failed to initialize %s group for distributed weight update for %s: %s",
+                    current_platform.communication_backend.upper(),
+                    meta.nccl_group_name,
+                    repr(fut.exception()),
+                )
+                return
             self.logger.info(
                 f"Initialized {current_platform.communication_backend.upper()} group "
                 f"for distributed weight update for {meta.nccl_group_name}."

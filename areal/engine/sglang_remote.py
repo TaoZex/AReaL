@@ -31,6 +31,7 @@ from areal.infra import RemoteInfEngine, RolloutController, WorkflowExecutor
 from areal.infra.platforms import current_platform
 from areal.infra.utils.launcher import TRITON_CACHE_PATH
 from areal.utils import perf_tracer, stats_tracker
+from areal.utils.network import format_host_for_url
 
 
 class SGLangBackend:
@@ -193,8 +194,8 @@ class SGLangBackend:
             )
         rank_offset = 1 + server_idx * meta.alloc_mode.gen.tp_size
         payload = {
-            "master_address": meta.nccl_master_address,
-            "master_port": str(meta.nccl_master_port),
+            "master_address": format_host_for_url(meta.nccl_master_address),
+            "master_port": meta.nccl_master_port,
             "rank_offset": rank_offset,
             "world_size": meta.alloc_mode.gen.world_size + 1,
             "backend": current_platform.communication_backend,
