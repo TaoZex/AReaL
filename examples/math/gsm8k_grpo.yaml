@@ -171,10 +171,6 @@ stats_logger:
     project: "my-project"
     entity: "my-team"
 
-  swanlab:
-    mode: "local"  # "online"、"local" 或 "disabled"
-    project: "my-project"
-
   tensorboard:
     path: "/path/to/tensorboard/logs"  # null 禁用
 
