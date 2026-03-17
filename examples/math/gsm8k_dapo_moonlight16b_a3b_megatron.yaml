@@ -43,7 +43,8 @@ gconfig:
 actor:
   experiment_name: ${experiment_name}
   trial_name: ${trial_name}
-  path: moonshotai/Moonlight-16B-A3B-Instruct
+  # path: moonshotai/Moonlight-16B-A3B-Instruct
+  path: Qwen1.5-MoE-A2.7B
   init_from_scratch: false
   disable_dropout: true
   gradient_checkpointing: true
