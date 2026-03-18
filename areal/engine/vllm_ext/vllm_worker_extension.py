@@ -11,6 +11,7 @@ from vllm.model_executor.model_loader import get_model_loader
 from areal.engine.core.distributed import init_custom_process_group
 from areal.infra.platforms import current_platform
 from areal.utils.constants import DIST_GROUP_DEFAULT_TIMEOUT
+from areal.utils.network import format_host_for_url
 
 logger = init_logger("vllm_worker_extension")
 
@@ -263,7 +264,7 @@ class VLLMWorkerExtension:
     def init_update_weight_group(
         self,
         master_address: str,
-        master_port: str,
+        master_port: int | str,
         rank_offset: int,
         world_size: int,
         backend: str,
@@ -272,10 +273,14 @@ class VLLMWorkerExtension:
         if not hasattr(self, "weight_update_groups"):
             self.weight_update_groups: dict[str, dist.ProcessGroup] = {}
         try:
+            host = master_address
+            if host.startswith("[") and host.endswith("]"):
+                host = host[1:-1]
+            master_port_i = int(master_port)
             group = init_custom_process_group(
                 backend=backend,
                 world_size=world_size,
-                init_method=f"tcp://{master_address}:{master_port}",
+                init_method=f"tcp://{format_host_for_url(host)}:{master_port_i}",
                 rank=self.rank + rank_offset,
                 group_name=group_name,
                 timeout=DIST_GROUP_DEFAULT_TIMEOUT,

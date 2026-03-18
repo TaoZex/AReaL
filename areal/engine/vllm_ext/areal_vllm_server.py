@@ -65,7 +65,7 @@ class UpdateWeightsRequestLora(OpenAIBaseModel):
 
 class UpdateGroupRequest(OpenAIBaseModel):
     master_address: str
-    master_port: str
+    master_port: int | str
     rank_offset: int
     world_size: int
     backend: str
@@ -190,7 +190,7 @@ async def init_weights_update_group(request: UpdateGroupRequest, raw_request: Re
         "init_update_weight_group",
         args=(
             request.master_address,
-            request.master_port,
+            str(request.master_port),
             request.rank_offset,
             request.world_size,
             request.backend,
