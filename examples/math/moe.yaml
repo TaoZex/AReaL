@@ -19,10 +19,10 @@ scheduler:
   type: null
 
 rollout:
-  backend: "sglang:d2p1t4"
+  backend: "sglang:d1p1t8"
   experiment_name: ${experiment_name}
   trial_name: ${trial_name}
-  max_concurrent_rollouts: 16
+  max_concurrent_rollouts: 2
   queue_size: null
   consumer_batch_size: ${train_dataset.batch_size}
   max_head_offpolicyness: 2
@@ -107,9 +107,9 @@ sglang:
   random_seed: ${seed}
   skip_tokenizer_init: true
   dtype: ${actor.dtype}
-  max_running_requests: 16
+  max_running_requests: 2
   context_length: 2048
-  mem_fraction_static: 0.75
+  mem_fraction_static: 0.2
 
 vllm:
   model: ${actor.path}
