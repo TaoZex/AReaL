@@ -19,7 +19,7 @@ scheduler:
   type: null
 
 rollout:
-  backend: "sglang:d1p1t2"
+  backend: "sglang:d2p1t4"
   experiment_name: ${experiment_name}
   trial_name: ${trial_name}
   max_concurrent_rollouts: 16
@@ -40,7 +40,7 @@ gconfig:
   temperature: 1.0
 
 actor:
-  backend: "megatron:d1p1t6"
+  backend: "megatron:d1p1t8"
   experiment_name: ${experiment_name}
   trial_name: ${trial_name}
   path: moonshotai/Moonlight-16B-A3B
@@ -94,7 +94,7 @@ ref:
   disable_dropout: true
   dtype: ${actor.dtype}
   mb_spec:
-    max_tokens_per_mb: 4096
+    max_tokens_per_mb: 1024
   optimizer: null
   scheduling_strategy:
     type: colocation
