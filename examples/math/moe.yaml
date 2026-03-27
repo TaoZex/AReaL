@@ -85,8 +85,8 @@ actor:
       gpu: 1
       mem: 32
       cmd: python3 -m areal.infra.rpc.rpc_server
-      env_vars:
-        PYTORCH_CUDA_ALLOC_CONF: "expandable_segments:True"
+      env_vars: {}
+        # PYTORCH_CUDA_ALLOC_CONF: "expandable_segments:True"
 
 ref:
   backend: ${actor.backend}
