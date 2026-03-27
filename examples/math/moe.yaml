@@ -110,8 +110,8 @@ sglang:
   max_running_requests: 1
   context_length: 2048
   mem_fraction_static: 0.3
-  enable_memory_saver: true
-  cpu_offload_gb: 16
+  enable_memory_saver: false
+  cpu_offload_gb: 0
 
 vllm:
   model: ${actor.path}
