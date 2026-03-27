@@ -48,8 +48,8 @@ actor:
   disable_dropout: true
   gradient_checkpointing: true
   dtype: bfloat16
-  megatron:
-    wrap_with_ddp: false
+  # megatron:
+  #   wrap_with_ddp: false
   mb_spec:
     max_tokens_per_mb: 1024
   optimizer:
