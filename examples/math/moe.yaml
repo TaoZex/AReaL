@@ -85,8 +85,8 @@ actor:
       gpu: 1
       mem: 32
       cmd: python3 -m areal.infra.rpc.rpc_server
-      env_vars: {}
-        # PYTORCH_CUDA_ALLOC_CONF: "expandable_segments:True"
+      env_vars:
+        PYTORCH_CUDA_ALLOC_CONF: "expandable_segments:True"
 
 ref:
   backend: ${actor.backend}
@@ -112,7 +112,9 @@ sglang:
   dtype: ${actor.dtype}
   max_running_requests: 1
   context_length: 2048
-  mem_fraction_static: 0.1
+  mem_fraction_static: 0.2
+  enable_memory_saver: true
+  cpu_offload_gb: 16
 
 vllm:
   model: ${actor.path}
