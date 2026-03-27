@@ -109,7 +109,7 @@ sglang:
   attention_backend: flashinfer
   max_running_requests: 1
   context_length: 2048
-  mem_fraction_static: 0.2
+  mem_fraction_static: 0.3
   enable_memory_saver: true
   cpu_offload_gb: 16
 
