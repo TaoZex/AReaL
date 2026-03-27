@@ -48,8 +48,6 @@ actor:
   disable_dropout: true
   gradient_checkpointing: true
   dtype: bfloat16
-  # megatron:
-  #   wrap_with_ddp: false
   mb_spec:
     max_tokens_per_mb: 1024
   optimizer:
@@ -85,8 +83,6 @@ actor:
       gpu: 1
       mem: 32
       cmd: python3 -m areal.infra.rpc.rpc_server
-      env_vars: {}
-        # PYTORCH_CUDA_ALLOC_CONF: "expandable_segments:True"
 
 ref:
   backend: ${actor.backend}
@@ -110,6 +106,7 @@ sglang:
   random_seed: ${seed}
   skip_tokenizer_init: true
   dtype: ${actor.dtype}
+  attention_backend: flashinfer
   max_running_requests: 1
   context_length: 2048
   mem_fraction_static: 0.2
