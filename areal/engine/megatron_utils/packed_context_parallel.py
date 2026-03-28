@@ -143,6 +143,8 @@ def packed_context_parallel_forward(
             input_ids, cu_seqlens
         )
         input_ids = input_ids.contiguous()
+        if position_ids.ndim == 1:
+            position_ids = position_ids.unsqueeze(0)
 
     # Pass tree_triton_data as attention_mask if present (for Triton tree attention)
     # Otherwise use the attention_mask from input (could be dense tensor for flex attention)
