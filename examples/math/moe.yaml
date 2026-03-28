@@ -19,7 +19,7 @@ scheduler:
   type: null
 
 rollout:
-  backend: "sglang:d1p1t2"
+  backend: "sglang:d1p1t8"
   experiment_name: ${experiment_name}
   trial_name: ${trial_name}
   max_concurrent_rollouts: 1
@@ -40,7 +40,7 @@ gconfig:
   temperature: 1.0
 
 actor:
-  backend: "megatron:d1p1t6e4"
+  backend: "megatron:d1p1t8e8"
   experiment_name: ${experiment_name}
   trial_name: ${trial_name}
   path: /tmp/areal/experiments/models/moonshotai/Moonlight-16B-A3B
@@ -83,8 +83,6 @@ actor:
       gpu: 1
       mem: 32
       cmd: python3 -m areal.infra.rpc.rpc_server
-      env_vars:
-        PYTORCH_CUDA_ALLOC_CONF: "expandable_segments:True"
 
 ref:
   backend: ${actor.backend}
@@ -111,7 +109,7 @@ sglang:
   attention_backend: flashinfer
   max_running_requests: 1
   context_length: 2048
-  mem_fraction_static: 0.85
+  mem_fraction_static: 0.3
   enable_memory_saver: true
   cpu_offload_gb: 16
 
