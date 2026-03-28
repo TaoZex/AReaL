@@ -40,7 +40,7 @@ gconfig:
   temperature: 1.0
 
 actor:
-  backend: "megatron:d3p1t2e2"
+  backend: "megatron:d1p1t6e4"
   experiment_name: ${experiment_name}
   trial_name: ${trial_name}
   path: /tmp/areal/experiments/models/moonshotai/Moonlight-16B-A3B
