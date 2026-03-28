@@ -226,6 +226,12 @@ class MegatronEngine(TrainEngine):
         self.device = torch.device(int(os.environ["LOCAL_RANK"]))
         self.rank = int(os.environ["RANK"])
         self.world_size = int(os.environ["WORLD_SIZE"])
+        self.logger.info(
+            "Rank device mapping: "
+            f"RANK={self.rank}, LOCAL_RANK={os.environ.get('LOCAL_RANK')}, "
+            f"CUDA_VISIBLE_DEVICES={os.environ.get('CUDA_VISIBLE_DEVICES')}, "
+            f"current_device={torch.cuda.current_device()}"
+        )
         self.is_pp_head = (
             mpu.get_data_parallel_rank(with_context_parallel=True) == 0
             and mpu.get_tensor_model_parallel_rank() == 0
