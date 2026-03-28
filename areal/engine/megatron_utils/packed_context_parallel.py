@@ -6,6 +6,22 @@ from megatron.core import parallel_state as mpu
 from megatron.core.packed_seq_params import PackedSeqParams
 
 
+def _trim_trailing_empty_sequences(cu_seqlens: torch.Tensor) -> torch.Tensor:
+    if cu_seqlens.ndim != 1:
+        raise ValueError(f"cu_seqlens must be 1D, got shape {tuple(cu_seqlens.shape)}")
+    if cu_seqlens.numel() < 2:
+        raise ValueError(
+            f"cu_seqlens must have at least 2 elements, got {cu_seqlens.numel()}"
+        )
+    while cu_seqlens.numel() >= 2 and cu_seqlens[-1].item() == cu_seqlens[-2].item():
+        cu_seqlens = cu_seqlens[:-1]
+    if cu_seqlens.numel() < 2:
+        raise ValueError(
+            f"cu_seqlens became too short after trimming, got {cu_seqlens.numel()}"
+        )
+    return cu_seqlens
+
+
 def preprocess_packed_seqs_context_parallel(
     input_ids: torch.Tensor,
     cu_seqlens: torch.Tensor,
@@ -135,6 +151,7 @@ def packed_context_parallel_forward(
     packed_seq_params = None
 
     if cu_seqlens is not None:
+        cu_seqlens = _trim_trailing_empty_sequences(cu_seqlens)
         if attention_mask is not None or tree_triton_data is not None:
             raise ValueError(
                 "Attention mask should be None when using packed sequences."
@@ -143,8 +160,6 @@ def packed_context_parallel_forward(
             input_ids, cu_seqlens
         )
         input_ids = input_ids.contiguous()
-        if position_ids.ndim == 1:
-            position_ids = position_ids.unsqueeze(0)
 
     # Pass tree_triton_data as attention_mask if present (for Triton tree attention)
     # Otherwise use the attention_mask from input (could be dense tensor for flex attention)
