@@ -1,4 +1,5 @@
 import dataclasses
+import os
 
 import torch
 from mbridge.core.bridge import Bridge
@@ -136,6 +137,13 @@ def make_mcore_model(
     is_critic: bool = False,
 ) -> list[GPTModel | DDP]:
     if bridge is not None:
+        attention_backend = os.environ.get("AREAL_MEGATRON_ATTENTION_BACKEND")
+        if attention_backend:
+            if hasattr(bridge, "config") and hasattr(
+                bridge.config, "attention_backend"
+            ):
+                bridge.config.attention_backend = attention_backend
+            os.environ.setdefault("MEGATRON_ATTENTION_BACKEND", attention_backend)
         models = bridge.get_model(
             # TODO: Add DDP options when supporting training
             wrap_with_ddp=mcore_config.wrap_with_ddp,
