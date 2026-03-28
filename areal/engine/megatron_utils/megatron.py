@@ -587,8 +587,10 @@ def convert_to_hf(
         List of (name, tensor) tuples in HuggingFace format. For FP8 quantization,
         returns both quantized weight and scale tensors.
     """
+    normalized_model_name = model_name.replace("_", "").replace("-", "").lower()
     for key, conversion_fn in _CONVERSION_FN_REGISTRY.items():
-        if key in model_name:
+        normalized_key = key.replace("_", "").replace("-", "").lower()
+        if normalized_key in normalized_model_name:
             converted_named_tensors = conversion_fn(tf_config, name, param)
             if quantization_config:
                 if fp8_direct_convert:
