@@ -115,7 +115,7 @@ sglang:
   attention_backend: flashinfer
   max_running_requests: 1
   context_length: 8192
-  mem_fraction_static: 0.2
+  mem_fraction_static: 0.15
 
 vllm:
   model: ${actor.path}
