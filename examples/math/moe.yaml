@@ -82,6 +82,9 @@ actor:
       port_count: 2
       gpu: 1
       mem: 32
+      env_vars:
+        NVTE_DEBUG: "1"
+        NVTE_DEBUG_LEVEL: "2"
       cmd: python3 -m areal.infra.rpc.rpc_server
 
 ref:
