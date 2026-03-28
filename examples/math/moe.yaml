@@ -108,7 +108,7 @@ sglang:
   dtype: ${actor.dtype}
   attention_backend: flashinfer
   max_running_requests: 1
-  context_length: 32768
+  context_length: 8192
   mem_fraction_static: 0.3
 
 vllm:
