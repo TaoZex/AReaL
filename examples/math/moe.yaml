@@ -19,7 +19,7 @@ scheduler:
   type: null
 
 rollout:
-  backend: "sglang:d1p1t8"
+  backend: "sglang:d1p1t8e8"
   experiment_name: ${experiment_name}
   trial_name: ${trial_name}
   max_concurrent_rollouts: 1
