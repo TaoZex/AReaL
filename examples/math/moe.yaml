@@ -85,6 +85,9 @@ actor:
       env_vars:
         NVTE_DEBUG: "1"
         NVTE_DEBUG_LEVEL: "2"
+        NVTE_FLASH_ATTN: "1"
+        NVTE_UNFUSED_ATTN: "1"
+        NVTE_FUSED_ATTN: "1"
       cmd: python3 -m areal.infra.rpc.rpc_server
 
 ref:
