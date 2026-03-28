@@ -86,6 +86,7 @@ actor:
         NVTE_DEBUG: "1"
         NVTE_DEBUG_LEVEL: "2"
         AREAL_MEGATRON_ATTENTION_BACKEND: "unfused"
+        NCCL_DEBUG: "WARN"
       cmd: python3 -m areal.infra.rpc.rpc_server
 
 ref:
