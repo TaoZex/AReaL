@@ -19,7 +19,7 @@ scheduler:
   type: null
 
 rollout:
-  backend: "sglang:d1p1t8e8"
+  backend: "sglang:d1p1t8"
   experiment_name: ${experiment_name}
   trial_name: ${trial_name}
   max_concurrent_rollouts: 1
@@ -113,7 +113,7 @@ sglang:
   attention_backend: flashinfer
   max_running_requests: 1
   context_length: 8192
-  mem_fraction_static: 0.3
+  mem_fraction_static: 0.2
 
 vllm:
   model: ${actor.path}
