@@ -1,5 +1,6 @@
 from typing import TypeVar
 
+import os
 import torch
 import torch.nn.functional as F
 from megatron.core.transformer import TransformerConfig
@@ -64,6 +65,10 @@ def hf_to_mcore_base_args(
         "masked_softmax_fusion": True,
         "moe_token_dispatcher_type": "alltoall",
     }
+
+    attention_backend = os.environ.get("AREAL_MEGATRON_ATTENTION_BACKEND")
+    if attention_backend is not None and attention_backend != "":
+        base_config["attention_backend"] = attention_backend
 
     # Update with any provided overrides
     # override_transformer_config_kwargs as kwargs shall never be none
