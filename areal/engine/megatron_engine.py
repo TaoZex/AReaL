@@ -221,9 +221,23 @@ class MegatronEngine(TrainEngine):
         if is_tms_enabled():
             torch_memory_saver.hook_mode = "preload"
 
-        current_platform.set_device(int(os.environ["LOCAL_RANK"]))
-        current_platform.set_numa_affinity(int(os.environ["LOCAL_RANK"]))
-        self.device = torch.device(int(os.environ["LOCAL_RANK"]))
+        cuda_visible_devices = os.environ.get("CUDA_VISIBLE_DEVICES", "")
+        local_rank = int(os.environ.get("LOCAL_RANK", "0"))
+        assigned_physical = None
+        if cuda_visible_devices and "," not in cuda_visible_devices:
+            token = cuda_visible_devices.strip()
+            if token.isdigit():
+                assigned_physical = int(token)
+        if cuda_visible_devices and "," not in cuda_visible_devices:
+            device_count = torch.cuda.device_count()
+            device_index = 0 if device_count == 1 else (assigned_physical or 0)
+        else:
+            device_index = local_rank
+        current_platform.set_device(device_index)
+        current_platform.set_numa_affinity(
+            assigned_physical if assigned_physical is not None else device_index
+        )
+        self.device = torch.device(device_index)
         self.rank = int(os.environ["RANK"])
         self.world_size = int(os.environ["WORLD_SIZE"])
         self.logger.info(
@@ -231,6 +245,12 @@ class MegatronEngine(TrainEngine):
             f"RANK={self.rank}, LOCAL_RANK={os.environ.get('LOCAL_RANK')}, "
             f"CUDA_VISIBLE_DEVICES={os.environ.get('CUDA_VISIBLE_DEVICES')}, "
             f"current_device={torch.cuda.current_device()}"
+        )
+        props = torch.cuda.get_device_properties(torch.cuda.current_device())
+        self.logger.info(
+            "Rank device properties: "
+            f"name={props.name}, pci_bus_id={getattr(props, 'pci_bus_id', None)}, "
+            f"uuid={getattr(props, 'uuid', None)}"
         )
         self.is_pp_head = (
             mpu.get_data_parallel_rank(with_context_parallel=True) == 0
