@@ -180,6 +180,50 @@ def packed_context_parallel_forward(
             position_ids=position_ids,
             packed_seq_params=packed_seq_params,
         )
+    except ValueError as e:
+        if (
+            cu_seqlens is None
+            or "No dot product attention backend is available" not in str(e)
+        ):
+            raise RuntimeError(
+                "Error occurred in packed context parallel forward pass "
+                f"({type(e).__name__}: {e}) on model {type(model).__name__} "
+                f"with input_ids shape {input_ids.shape}, position_ids shape {position_ids.shape}, "
+                f"and packed_seq_params {packed_seq_params}."
+            ) from e
+        if mpu.get_context_parallel_world_size() > 1:
+            raise RuntimeError(
+                "Packed context parallel forward pass failed because no dot product attention backend is available "
+                "and context parallelism is enabled. Disable context parallelism or ensure TransformerEngine has a valid backend "
+                "for packed sequences."
+            ) from e
+        packed_len = int(input_ids.shape[1])
+        seg_ids = torch.empty(
+            packed_len, dtype=torch.int32, device=input_ids.device
+        )
+        for i in range(int(cu_seqlens.numel() - 1)):
+            start = int(cu_seqlens[i].item())
+            end = int(cu_seqlens[i + 1].item())
+            seg_ids[start:end] = i
+        idx = torch.arange(packed_len, device=input_ids.device)
+        same_segment = seg_ids[:, None] == seg_ids[None, :]
+        causal = idx[None, :] <= idx[:, None]
+        fallback_attention_mask = (~(same_segment & causal)).unsqueeze(0).unsqueeze(0)
+        try:
+            output = model(
+                input_ids=input_ids,
+                attention_mask=fallback_attention_mask,
+                position_ids=position_ids,
+                packed_seq_params=None,
+            )
+        except Exception as e2:
+            raise RuntimeError(
+                "Error occurred in packed context parallel forward pass "
+                f"(ValueError: {e}) and fallback masked forward also failed "
+                f"({type(e2).__name__}: {e2}) on model {type(model).__name__} "
+                f"with input_ids shape {input_ids.shape}, position_ids shape {position_ids.shape}, "
+                f"and packed_seq_params {packed_seq_params}."
+            ) from e2
     except Exception as e:
         raise RuntimeError(
             "Error occurred in packed context parallel forward pass "
