@@ -49,7 +49,7 @@ actor:
   gradient_checkpointing: true
   dtype: bfloat16
   mb_spec:
-    max_tokens_per_mb: 10240
+    max_tokens_per_mb: 8192
   optimizer:
     type: adam
     lr: 3e-6
@@ -84,6 +84,7 @@ actor:
       gpu: 1
       mem: 32
       env_vars:
+        PYTORCH_CUDA_ALLOC_CONF: "expandable_segments:True"
         NVTE_DEBUG: "1"
         NVTE_DEBUG_LEVEL: "2"
         AREAL_MEGATRON_ATTENTION_BACKEND: "unfused"
