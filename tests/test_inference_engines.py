@@ -3,6 +3,7 @@
 import os
 
 import pytest
+import torch
 import torch.distributed as dist
 
 from tests.utils import get_model_path
@@ -398,3 +399,169 @@ def test_disk_update_weights_from_fsdp_engine(tmp_path_factory, inference_engine
         if inf_engine is not None:
             inf_engine.destroy()
         assert not dist.is_initialized()
+
+
+@pytest.mark.slow
+@pytest.mark.ci
+@pytest.mark.sglang
+@pytest.mark.skipif(
+    not hasattr(torch.cuda, "device_count") or torch.cuda.device_count() < 8,
+    reason="Requires at least 8 GPUs to run SGLang with tp_size=2 and pp_size=2 alongside a training engine with parallel size 4"
+)
+@pytest.mark.parametrize("train_backend", ["fsdp:d4", "megatron:d1p2t2", "archon:d4"])
+def test_sglang_e2e_tp2_pp2_weight_update_nccl(tmp_path_factory, train_backend):
+    """Test nccl-based weight updates from FSDP/Megatron/Archon engines to SGLang with tp=2, pp=2."""
+    import areal.utils.name_resolve as name_resolve
+    from areal.api import FinetuneSpec, ModelAllocation
+    from areal.api.cli_args import (
+        OptimizerConfig,
+        TrainEngineConfig,
+        NameResolveConfig,
+        MegatronEngineConfig,
+    )
+    from areal.engine.sglang_remote import RemoteSGLangEngine
+
+    os.environ["WORLD_SIZE"] = "1"
+    os.environ["RANK"] = "0"
+    os.environ["LOCAL_RANK"] = "0"
+    os.environ["MASTER_ADDR"] = "localhost"
+    os.environ["MASTER_PORT"] = "7778"
+    os.environ["NCCL_CUMEM_ENABLE"] = "0"
+    os.environ["NCCL_NVLS_ENABLE"] = "0"
+
+    expr_name = f"test_e2e_tp2_pp2_{train_backend.split(':')[0]}"
+    trial_name = "trial_0"
+
+    engine_config = TrainEngineConfig(
+        backend=train_backend,
+        experiment_name=expr_name,
+        trial_name=trial_name,
+        path=MODEL_PATH,
+        optimizer=OptimizerConfig(),
+    )
+
+    if train_backend.startswith("fsdp"):
+        from areal.engine import FSDPEngine
+        train_engine = FSDPEngine(engine_config)
+    elif train_backend.startswith("megatron"):
+        from areal.engine import MegatronEngine
+        engine_config.megatron = MegatronEngineConfig()
+        train_engine = MegatronEngine(engine_config)
+    elif train_backend.startswith("archon"):
+        from areal.experimental.engine.archon_engine import ArchonEngine
+        train_engine = ArchonEngine(engine_config)
+    else:
+        raise ValueError(f"Unknown backend: {train_backend}")
+
+    alloc_mode = ModelAllocation.from_str(train_backend)
+    train_engine.create_process_group(parallel_strategy=alloc_mode.parallel)
+    inf_engine = None
+    server_manager = None
+    
+    try:
+        ft_spec = FinetuneSpec(
+            total_train_epochs=1, dataset_size=100, train_batch_size=2
+        )
+        train_engine.initialize(None, ft_spec)
+        train_engine.model_version = 100
+
+        nfs_record_root = tmp_path_factory.mktemp("nfs_record_path")
+        name_resolve_config = NameResolveConfig(
+            type="nfs", nfs_record_root=nfs_record_root
+        )
+        name_resolve.reconfigure(name_resolve_config)
+
+        # Launch SGLang server with tp=2, pp=2
+        sglang_config = SGLangConfig(
+            skip_tokenizer_init=True,
+            model_path=MODEL_PATH,
+            mem_fraction_static=0.2,
+            context_length=128,
+        )
+        dist_port = network.find_free_ports(1)[0]
+        host = network.gethostip()
+        sglang_args = SGLangConfig.build_args(
+            sglang_config=sglang_config,
+            tp_size=2,
+            pp_size=2,
+            base_gpu_id=0,
+            dist_init_addr=f"{host}:{dist_port}",
+        )
+
+        config = InferenceEngineConfig(
+            backend="sglang:d1",
+            experiment_name=expr_name,
+            trial_name=trial_name,
+            setup_timeout=360,
+        )
+        server_manager = RemoteSGLangEngine(config)
+        server_info = server_manager.launch_server(sglang_args)
+
+        inf_engine = RemoteSGLangEngine(config)
+        inf_engine.initialize(addr=f"{server_info.host}:{server_info.port}")
+        inf_engine.set_version(100)
+
+        # Get WeightUpdateMeta for XCCL
+        meta = WeightUpdateMeta.from_fsdp_xccl(
+            gen_allocation=ModelAllocation.from_str("sglang:d1"),
+        )
+        meta.gen_allocation.parallel.tp_size = 2
+        meta.gen_allocation.parallel.pp_size = 2
+        meta.nccl_group_name = "test_nccl_group"
+
+        train_engine.connect_engine(inf_engine, meta)
+        train_engine.set_version(100)
+        train_engine.update_weights(meta)
+    finally:
+        train_engine.destroy()
+        if inf_engine is not None:
+            inf_engine.destroy()
+        if server_manager is not None:
+            server_manager.teardown_server()
+            server_manager.destroy()
+        assert not dist.is_initialized()
+
+
+def test_sglang_backend_build_init_weights_group_request_pp_size():
+    """Test SGLangBackend builds the correct init weights group request with PP size > 1."""
+    from areal.api import WeightUpdateMeta
+    from areal.engine.sglang_remote import SGLangBackend
+    from unittest.mock import patch, MagicMock
+    
+    backend = SGLangBackend()
+    
+    # Mock the gen_allocation and its parallel properties
+    mock_gen_allocation = MagicMock()
+    mock_gen_allocation.parallel.tp_size = 2
+    mock_gen_allocation.parallel.pp_size = 4
+    mock_gen_allocation.parallel.world_size = 8
+    
+    meta = WeightUpdateMeta(
+        type="distributed",
+        path="",
+        nccl_master_address="127.0.0.1",
+        nccl_master_port=12345,
+        nccl_group_name="test_group",
+        gen_allocation=mock_gen_allocation
+    )
+    
+    with patch("areal.engine.sglang_remote.current_platform") as mock_platform:
+        mock_platform.communication_backend = "nccl"
+        
+        server_idx = 2
+        request = backend.build_init_weights_group_request(
+            addr="http://localhost:8000",
+            server_idx=server_idx,
+            meta=meta
+        )
+        
+        # rank_offset = 1 + server_idx * tp_size * pp_size
+        # = 1 + 2 * 2 * 4 = 1 + 16 = 17
+        expected_rank_offset = 17
+        
+        assert request.endpoint == "/init_weights_update_group"
+        assert request.payload["rank_offset"] == expected_rank_offset
+        assert request.payload["master_address"] == "127.0.0.1"
+        assert request.payload["master_port"] == "12345"
+        assert request.payload["world_size"] == 9  # 8 + 1
+        assert request.payload["group_name"] == "test_group"
