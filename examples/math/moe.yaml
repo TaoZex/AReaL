@@ -51,7 +51,7 @@ actor:
   mb_spec:
     max_tokens_per_mb: 2048
   optimizer:
-    type: adam
+    type: adam_bf16
     lr: 3e-6
     weight_decay: 0.003
     beta1: 0.9
