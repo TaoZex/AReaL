@@ -66,7 +66,7 @@ actor:
   reward_bias: -0.5
   kl_ctl: 0.0
   ppo_n_minibatches: 1
-  weight_update_mode: xccl
+  weight_update_mode: disk
   recompute_logprob: true
   use_decoupled_loss: true
   behave_imp_weight_cap: 5.0
