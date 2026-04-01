@@ -1738,7 +1738,7 @@ class InferenceEngineConfig:
     )
     # Backend and parallelism (new per-engine config)
     backend: str = field(
-        default=MISSING,
+        default="",
         metadata={
             "help": "Backend and parallelism strategy. Must include an explicit backend prefix, "
             "e.g. 'sglang:d4', 'vllm:d2t4'. Required."
