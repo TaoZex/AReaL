@@ -1636,6 +1636,9 @@ class SGLangConfig:
         args.pop("enable_multithread_load", None)
         args.pop("tp_size", None)
         args.pop("pp_size", None)
+        # Remove n_nodes and node_rank to avoid conflict with nnodes
+        args.pop("n_nodes", None)
+        args.pop("node_rank", None)
 
         args = dict(
             # Model and tokenizer
