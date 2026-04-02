@@ -420,6 +420,28 @@ def load_weights_from_hf_with_mbridge_fast(
 ) -> None:
     if hasattr(bridge, "_get_actual_hf_path"):
         weights_path = bridge._get_actual_hf_path(weights_path)
+        
+    if not os.path.exists(weights_path):
+        try:
+            from huggingface_hub.utils import validate_repo_id
+            validate_repo_id(weights_path)
+            is_valid_repo = True
+        except Exception:
+            is_valid_repo = False
+            
+        if is_valid_repo:
+            from huggingface_hub import snapshot_download
+            try:
+                # We only need safetensors and json config files for loading weights
+                weights_path = snapshot_download(
+                    repo_id=weights_path,
+                    allow_patterns=["*.safetensors", "*.json"]
+                )
+            except Exception as e:
+                raise RuntimeError(f"Failed to download model {weights_path} from HuggingFace Hub: {e}") from e
+        else:
+            raise FileNotFoundError(f"Model path {weights_path} does not exist locally and is not a valid HuggingFace repo id.")
+            
     index_file = os.path.join(weights_path, "model.safetensors.index.json")
     manual_tie_word_embedding = False
     index = {}
