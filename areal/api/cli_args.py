@@ -1635,7 +1635,7 @@ class SGLangConfig:
             )
         args.pop("enable_multithread_load", None)
 
-        args = dict(
+        args.update(
             # Model and tokenizer
             tokenizer_path=sglang_config.model_path,
             tokenizer_mode="auto",
@@ -1651,7 +1651,6 @@ class SGLangConfig:
             node_rank=node_rank,
             # initialization addresses and ports
             dist_init_addr=dist_init_addr,
-            **args,
         )
         if host is not None:
             args["host"] = host
