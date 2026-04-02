@@ -418,7 +418,8 @@ def load_weights_from_hf_with_mbridge_fast(
     is_critic: bool = False,
     fp8_direct_convert: bool = False,
 ) -> None:
-    weights_path = bridge._get_actual_hf_path(weights_path)
+    if hasattr(bridge, "_get_actual_hf_path"):
+        weights_path = bridge._get_actual_hf_path(weights_path)
     index_file = os.path.join(weights_path, "model.safetensors.index.json")
     manual_tie_word_embedding = False
     index = {}
