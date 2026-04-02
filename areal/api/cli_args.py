@@ -1634,8 +1634,10 @@ class SGLangConfig:
                 model_loader_extra_config, separators=(",", ":")
             )
         args.pop("enable_multithread_load", None)
+        args.pop("tp_size", None)
+        args.pop("pp_size", None)
 
-        args.update(
+        args = dict(
             # Model and tokenizer
             tokenizer_path=sglang_config.model_path,
             tokenizer_mode="auto",
@@ -1651,6 +1653,7 @@ class SGLangConfig:
             node_rank=node_rank,
             # initialization addresses and ports
             dist_init_addr=dist_init_addr,
+            **args,
         )
         if host is not None:
             args["host"] = host
