@@ -180,9 +180,3 @@ perf_tracer:
   enabled: false
   session_tracer:
     enabled: false
-
-launcher:
-  inference_server_cpus_per_gpu: 4
-  inference_server_mem_per_gpu: 49152
-  trainer_cpus_per_gpu: 4
-  trainer_mem_per_gpu: 49152
