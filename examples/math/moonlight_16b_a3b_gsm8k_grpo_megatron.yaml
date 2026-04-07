@@ -81,7 +81,7 @@ actor:
     use_deterministic_algorithms: false
     recompute_granularity: full
     recompute_method: uniform
-    recompute_num_layers: 14
+    recompute_num_layers: 1
   scheduling_spec:
     - task_type: worker
       port_count: 2
