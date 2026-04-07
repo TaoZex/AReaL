@@ -9,10 +9,10 @@ tokenizer_path: ${actor.path}
 cluster:
   n_nodes: 1
   n_gpus_per_node: 8
-  fileroot: /tmp/areal/experiments
+  fileroot: /tmp/areal/moon_experiments
   name_resolve:
     type: nfs
-    nfs_record_root: /tmp/areal/name_resolve
+    nfs_record_root: /tmp/areal/moon_name_resolve
 
 scheduler:
   type: null
@@ -42,7 +42,7 @@ actor:
   backend: "megatron:(attn:d1p2t4|ffn:d1p2t1e4)"
   experiment_name: ${experiment_name}
   trial_name: ${trial_name}
-  path: /models/Moonlight-16B-A3B-Instruct
+  path: moonshotai/Moonlight-16B-A3B-Instruct
   init_from_scratch: false
   disable_dropout: true
   gradient_checkpointing: true
