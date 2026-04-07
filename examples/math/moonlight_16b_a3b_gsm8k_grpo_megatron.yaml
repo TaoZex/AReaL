@@ -114,7 +114,7 @@ sglang:
   max_running_requests: 16
   context_length: 4096
   mem_fraction_static: 0.75
-  enable_ep_moe: true
+  expert_parallel_size: 2
   attention_backend: triton
 
 vllm:
