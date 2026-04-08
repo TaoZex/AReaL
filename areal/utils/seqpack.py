@@ -382,6 +382,47 @@ def kk_allocate(
     n_groups_divisor: int = 1,
     equal_size: bool = False,
 ) -> list[list[int]]:
+    """Partition *values* into groups using the Karmarkar-Karp differencing method.
+
+    This is a **drop-in replacement** for :func:`ffd_allocate` that typically
+    produces more balanced partitions (lower max-min spread across groups),
+    at the cost of slightly higher computation.
+
+    The algorithm works by iteratively combining the two most "unbalanced"
+    partial partitions.  It is especially effective when sequence lengths are
+    highly variable (e.g. in RL rollouts with diverse prompt/response lengths).
+
+    The number of groups is determined by ``max(min_groups, ceil(total / capacity))``,
+    matching the approach used by veRL's ``rearrange_micro_batches`` which computes
+    ``num_micro_batches = ceildiv(total_seqlen, max_token_len)`` before calling KK.
+
+    Args:
+        values: Sequence lengths (or token counts) to pack.
+        capacity: Maximum sum of values per group.  When set to a very large
+            number the algorithm effectively ignores the capacity constraint
+            and just balances the groups.
+        min_groups: Minimum number of output groups.
+        n_groups_divisor: The number of groups must be divisible by this value.
+            Useful for pipeline parallelism.
+        equal_size: If ``True``, every group will contain exactly
+            ``len(values) // k`` items.  Requires ``len(values) % k == 0``.
+
+    Returns:
+        A list of groups, where each group is a list of original indices into
+        *values*.
+
+    Raises:
+        RuntimeError: If any single value exceeds *capacity*, or if there are
+            fewer values than *min_groups*.
+
+    Ref:
+        https://en.wikipedia.org/wiki/Largest_differencing_method
+    
+    Example::
+
+        >>> kk_allocate([100, 200, 300, 150, 250], capacity=500, min_groups=2)
+        [[2, 0], [4, 1, 3]]
+    """
     if min_groups is None or min_groups < n_groups_divisor:
         min_groups = n_groups_divisor
 
@@ -398,8 +439,12 @@ def kk_allocate(
     total = sum(values)
     k = max(min_groups, math.ceil(total / capacity))
 
+    # Respect n_groups_divisor (e.g., for pipeline parallelism)
     if n_groups_divisor > 1:
         k = math.ceil(k / n_groups_divisor) * n_groups_divisor
+
+    # k cannot exceed the number of values
+    k = min(k, len(values))
 
     if equal_size and len(values) % k != 0:
         raise RuntimeError(
@@ -409,7 +454,8 @@ def kk_allocate(
 
     partitions = _kk_partition(values, k, equal_size=equal_size)
 
-    # 仍保留 capacity 校验作为安全网，但正常情况下不应再触发
+    # Safety net: if any group still exceeds capacity (e.g., due to a single
+    # very large item close to capacity), fall back to FFD.
     for group in partitions:
         group_sum = sum(values[i] for i in group)
         if group_sum > capacity:
