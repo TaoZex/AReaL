@@ -1,9 +1,14 @@
 import bisect
+import heapq
 import itertools
 from typing import Any
 
 import numba
 import numpy as np
+
+from areal.utils import logging
+
+logger = logging.getLogger("SeqPack")
 
 
 def flat2d(arr: list[list[Any]]) -> list[Any]:
@@ -145,6 +150,44 @@ def reorder_to_balanced_batches(
     return np.array(reordered_indices), max_diff
 
 
+# =============================================================================
+# Packing Algorithm Registry
+# =============================================================================
+
+# Supported packing algorithm names (used in MicroBatchSpec.packing_algorithm)
+PACKING_ALGORITHM_FFD = "ffd"
+PACKING_ALGORITHM_KK = "kk"
+PACKING_ALGORITHMS = {PACKING_ALGORITHM_FFD, PACKING_ALGORITHM_KK}
+
+
+def get_allocate_fn(algorithm: str = PACKING_ALGORITHM_FFD):
+    """Return the allocation function for the given algorithm name.
+
+    Args:
+        algorithm: One of ``"ffd"`` or ``"kk"``.
+
+    Returns:
+        The corresponding allocation function (``ffd_allocate`` or ``kk_allocate``).
+
+    Raises:
+        ValueError: If the algorithm name is not recognized.
+    """
+    if algorithm == PACKING_ALGORITHM_FFD:
+        return ffd_allocate
+    elif algorithm == PACKING_ALGORITHM_KK:
+        return kk_allocate
+    else:
+        raise ValueError(
+            f"Unknown packing algorithm '{algorithm}'. "
+            f"Supported algorithms: {sorted(PACKING_ALGORITHMS)}"
+        )
+
+
+# =============================================================================
+# FFD (First Fit Decreasing) Algorithm
+# =============================================================================
+
+
 # @numba.njit
 def _ffd_allocate(
     values: np.ndarray, capacity: int, min_groups: int, n_groups_divisor: int = 1
@@ -208,6 +251,219 @@ def ffd_allocate(
     return res
 
 
+# =============================================================================
+# Karmarkar-Karp (KK) Algorithm — Largest Differencing Method
+# =============================================================================
+#
+# The KK algorithm produces more balanced partitions than FFD by iteratively
+# combining the two most "unbalanced" partial partitions. It is especially
+# effective when the goal is to minimise the max-min spread of group sums —
+# a common objective for balancing GPU workloads in RL training.
+#
+# References:
+#   - veRL:  https://github.com/verl-project/verl  (verl/utils/seqlen_balancing.py)
+#   - SLIME: https://github.com/THUDM/slime
+#   - R.E. Korf, "Multi-Way Number Partitioning", IJCAI 2009
+# =============================================================================
+
+
+class _KKSet:
+    """A set of items with a running sum, used inside KK partitioning."""
+
+    __slots__ = ("sum", "items")
+
+    def __init__(self) -> None:
+        self.sum: int = 0
+        self.items: list[tuple[int, int]] = []  # (original_index, value)
+
+    def add(self, idx: int, val: int) -> None:
+        self.items.append((idx, val))
+        self.sum += val
+
+    def merge(self, other: "_KKSet") -> None:
+        for idx, val in other.items:
+            self.items.append((idx, val))
+            self.sum += val
+
+    def __lt__(self, other: "_KKSet") -> bool:
+        if self.sum != other.sum:
+            return self.sum < other.sum
+        if len(self.items) != len(other.items):
+            return len(self.items) < len(other.items)
+        return self.items < other.items
+
+
+class _KKState:
+    """Represents one candidate partitioning state in the KK priority queue.
+
+    Each state contains *k* sets.  Two states are merged by pairing the
+    largest set of one with the smallest set of the other, which minimises
+    the spread (max_sum − min_sum) across partitions.
+    """
+
+    __slots__ = ("k", "sets")
+
+    def __init__(self, items: list[tuple[int, int]], k: int) -> None:
+        self.k = k
+        self.sets = [_KKSet() for _ in range(k)]
+        assert len(items) in (1, k), f"{len(items)} not in [1, {k}]"
+        for i, (idx, val) in enumerate(items):
+            self.sets[i].add(idx=idx, val=val)
+        self.sets.sort(reverse=True)
+
+    def get_partitions(self) -> list[list[int]]:
+        return [[idx for idx, _ in s.items] for s in self.sets]
+
+    def merge(self, other: "_KKState") -> None:
+        # Pair the largest set of *self* with the smallest set of *other*
+        # and vice-versa, so that the combined spread is minimised.
+        for i in range(self.k):
+            self.sets[i].merge(other.sets[self.k - 1 - i])
+        self.sets.sort(reverse=True)
+
+    @property
+    def spread(self) -> int:
+        return self.sets[0].sum - self.sets[-1].sum
+
+    def __lt__(self, other: "_KKState") -> bool:
+        # Max-heap by spread: largest spread is popped first.
+        if self.spread != other.spread:
+            return self.spread > other.spread
+        return self.sets[0] > other.sets[0]
+
+
+def _kk_partition(
+    values: list[int], k: int, equal_size: bool = False
+) -> list[list[int]]:
+    """Core KK partitioning using the Largest Differencing Method.
+
+    Args:
+        values: List of integer values to partition.
+        k: Number of partitions to create.
+        equal_size: If True, each partition will have exactly
+            ``len(values) // k`` items.
+
+    Returns:
+        List of k partitions, each containing indices into *values*.
+    """
+    sorted_items = sorted(
+        [(val, idx) for idx, val in enumerate(values)]
+    )  # ascending by value
+
+    states_pq: list[_KKState] = []
+
+    if equal_size:
+        assert len(values) % k == 0, f"{len(values)} % {k} != 0"
+        for offset in range(0, len(sorted_items), k):
+            items = []
+            for i in range(k):
+                val, idx = sorted_items[offset + i]
+                items.append((idx, val))
+            heapq.heappush(states_pq, _KKState(items=items, k=k))
+    else:
+        for val, idx in sorted_items:
+            heapq.heappush(states_pq, _KKState(items=[(idx, val)], k=k))
+
+    while len(states_pq) > 1:
+        s0 = heapq.heappop(states_pq)
+        s1 = heapq.heappop(states_pq)
+        s0.merge(s1)
+        heapq.heappush(states_pq, s0)
+
+    final = states_pq[0]
+    return final.get_partitions()
+
+
+def kk_allocate(
+    values: list[int],
+    capacity: int,
+    min_groups: int,
+    n_groups_divisor: int = 1,
+    equal_size: bool = False,
+) -> list[list[int]]:
+    """Partition *values* into groups using the Karmarkar-Karp differencing method.
+
+    This is a **drop-in replacement** for :func:`ffd_allocate` that typically
+    produces more balanced partitions (lower max-min spread across groups),
+    at the cost of slightly higher computation.
+
+    The algorithm works by iteratively combining the two most "unbalanced"
+    partial partitions.  It is especially effective when sequence lengths are
+    highly variable (e.g. in RL rollouts with diverse prompt/response lengths).
+
+    Args:
+        values: Sequence lengths (or token counts) to pack.
+        capacity: Maximum sum of values per group.  When set to a very large
+            number the algorithm effectively ignores the capacity constraint
+            and just balances the groups.
+        min_groups: Minimum number of output groups.
+        n_groups_divisor: The number of groups must be divisible by this value.
+            Useful for pipeline parallelism.
+        equal_size: If ``True``, every group will contain exactly
+            ``len(values) // min_groups`` items.  Requires ``len(values) %
+            min_groups == 0``.
+
+    Returns:
+        A list of groups, where each group is a list of original indices into
+        *values*.
+
+    Raises:
+        RuntimeError: If any single value exceeds *capacity*, or if there are
+            fewer values than *min_groups*.
+
+    Example::
+
+        >>> kk_allocate([100, 200, 300, 150, 250], capacity=500, min_groups=2)
+        [[2, 0], [4, 1, 3]]
+    """
+    if min_groups is None or min_groups < n_groups_divisor:
+        min_groups = n_groups_divisor
+
+    if any(v > capacity for v in values):
+        raise RuntimeError(
+            f"Some values exceed capacity {capacity}. "
+            "Cannot pack a single item that is larger than the bin."
+        )
+    if len(values) < min_groups:
+        raise RuntimeError(
+            f"Number of values {len(values)} is smaller than min_groups {min_groups}"
+        )
+
+    k = min_groups
+
+    if equal_size and len(values) % k != 0:
+        raise RuntimeError(
+            f"equal_size=True requires len(values) ({len(values)}) "
+            f"to be divisible by min_groups ({k})"
+        )
+
+    partitions = _kk_partition(values, k, equal_size=equal_size)
+
+    # Respect n_groups_divisor
+    if len(partitions) % n_groups_divisor != 0:
+        k += n_groups_divisor - k % n_groups_divisor
+        if len(values) < k:
+            raise RuntimeError(
+                f"Cannot allocate values that satisfy min_groups and "
+                f"n_groups_divisor {n_groups_divisor}."
+            )
+        partitions = _kk_partition(values, k, equal_size=equal_size)
+
+    # Validate capacity constraint — fall back to FFD if violated
+    for group in partitions:
+        group_sum = sum(values[i] for i in group)
+        if group_sum > capacity:
+            logger.warning(
+                "KK partition violates capacity constraint (%d > %d), "
+                "falling back to FFD.",
+                group_sum,
+                capacity,
+            )
+            return ffd_allocate(values, capacity, min_groups, n_groups_divisor)
+
+    return partitions
+
+
 def balanced_greedy_partition(nums: list[int], K: int) -> list[list[int]]:
     """
     Splits `nums` into K groups such that the maximum difference between group sums is minimized.
@@ -263,10 +519,6 @@ if __name__ == "__main__":
     for i in range(100):
         st = time.monotonic()
         nums = np.random.randint(1024, 8192, size=(100,)).tolist()
-        # k = np.random.randint(2, 20)
-        # min_size = np.random.randint(1, len(nums) // k)
-        # res = min_abs_diff_partition(nums, k, min_size)
-        # assert all(y - x >= min_size for x, y in res)
         max_tokens_per_mb = 163840
         min_n_groups = np.random.randint(1, 8)
         groups = ffd_allocate(nums, max_tokens_per_mb, min_n_groups)

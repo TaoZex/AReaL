@@ -13,7 +13,7 @@ from areal.utils.data import (
     split_and_unpad_tensor,
     tensor_container_to,
 )
-from areal.utils.seqpack import ffd_allocate
+from areal.utils.seqpack import ffd_allocate, get_allocate_fn
 
 
 @dataclass
@@ -27,6 +27,7 @@ class RedistributedData:
 def redistribute_trajectories(
     trajectories: list[dict[str, Any]],
     group=None,
+    packing_algorithm: str = "ffd",
 ) -> RedistributedData:
     """Redistribute a list of trajectory dicts across a process group.
 
@@ -41,6 +42,8 @@ def redistribute_trajectories(
         contains tensors with shape [batch_size, seqlen, ...].
     group : dist.ProcessGroup, optional
         The process group for communication. If None, uses the default group.
+    packing_algorithm : str, optional
+        Packing algorithm to use ("ffd" or "kk"). Default is "ffd".
 
     Returns
     -------
@@ -71,9 +74,10 @@ def redistribute_trajectories(
         for d in all_data
     ]
 
+    allocate_fn = get_allocate_fn(packing_algorithm)
     # Allocate trajectories to ranks using first-fit-decreasing
     # No capacity limit leads to balanced partition across this group
-    group_indices = ffd_allocate(
+    group_indices = allocate_fn(
         seqlens, capacity=int(1e12), min_groups=dist.get_world_size(group)
     )
     local_indices = group_indices[dist.get_rank(group=group)]
@@ -117,9 +121,14 @@ class DistRolloutCoordinator:
             Redistributed and broadcast batch available on all ranks (list of trajs)
         """
         if trajectories is not None:
+            packing_algorithm = getattr(
+                getattr(self.train_engine, "config", None), "mb_spec", None
+            )
+            packing_algorithm = getattr(packing_algorithm, "packing_algorithm", "ffd")
             redist = redistribute_trajectories(
                 trajectories,
                 group=self.train_engine.data_parallel_group,
+                packing_algorithm=packing_algorithm,
             )
             batch = redist.data
         else:
