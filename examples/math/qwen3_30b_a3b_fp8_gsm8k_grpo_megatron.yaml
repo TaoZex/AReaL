@@ -78,7 +78,7 @@ actor:
   weight_update_mode: disk
   max_new_tokens: ${gconfig.max_new_tokens}
   megatron:
-    use_deterministic_algorithms: true
+    use_deterministic_algorithms: false
     fp8_config:
       mode: hybrid
       recipe: delayed
