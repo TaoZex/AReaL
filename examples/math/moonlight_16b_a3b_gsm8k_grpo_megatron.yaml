@@ -39,7 +39,7 @@ gconfig:
   temperature: 1.0
 
 actor:
-  backend: "megatron:(attn:d1p2t4|ffn:d1p2t1e4)"
+  backend: "megatron:(attn:d1p1t8|ffn:d1p1t1e8)"
   experiment_name: ${experiment_name}
   trial_name: ${trial_name}
   path: /workspace/models/Moonlight-16B-A3B-Instruct
@@ -112,7 +112,7 @@ sglang:
   skip_tokenizer_init: true
   dtype: bfloat16
   max_running_requests: 16
-  context_length: 4096
+  context_length: 2048
   mem_fraction_static: 0.25
   attention_backend: triton
 
