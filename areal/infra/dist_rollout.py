@@ -75,7 +75,7 @@ def redistribute_trajectories(
     ]
 
     allocate_fn = get_allocate_fn(packing_algorithm)
-    # Allocate trajectories to ranks using first-fit-decreasing
+    # Allocate trajectories to ranks using the configured packing algorithm
     # No capacity limit leads to balanced partition across this group
     group_indices = allocate_fn(
         seqlens, capacity=int(1e12), min_groups=dist.get_world_size(group)

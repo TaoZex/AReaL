@@ -138,8 +138,6 @@ class MicroBatchSpec:
 
     def __post_init__(self):
         """Validate packing algorithm configuration."""
-        from areal.utils.seqpack import PACKING_ALGORITHMS
-
         if self.packing_algorithm not in PACKING_ALGORITHMS:
             raise ValueError(
                 f"packing_algorithm must be one of {sorted(PACKING_ALGORITHMS)}, "

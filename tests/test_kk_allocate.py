@@ -275,15 +275,15 @@ class TestKKAllocate:
             kk_allocate([10], capacity=100, min_groups=5)
 
     def test_k_upper_bound_cap(self):
-        """Verify that k is capped at len(values) and does not exceed it.
+        """Verify k = min(k, len(values)) prevents k from exceeding n.
 
-        When n_groups_divisor rounding would push k above len(values), the
-        min(k, len(values)) guard ensures no crash.
+        The cap is triggered when n_groups_divisor roundup pushes k
+        above len(values).  Without the cap, _KKState assertion would fail.
         """
-        # 5 items, total=500, capacity=90 → ceil(500/90)=6, but min(6,5)=5
+        # 5 items, total=500, cap=200 → k=3, divisor=8 → roundup=8, min(8,5)=5
         values = [100, 100, 100, 100, 100]
-        result = kk_allocate(values, capacity=120, min_groups=1)
-        assert len(result) <= len(values)
+        result = kk_allocate(values, capacity=200, min_groups=1, n_groups_divisor=8)
+        assert len(result) == 5  # capped at len(values), not 8
         all_idx = sorted(sum(result, []))
         assert all_idx == list(range(5))
 
@@ -295,15 +295,13 @@ class TestKKAllocate:
         assert len(result) <= 5
         assert len(result) % 4 == 0 or len(result) == 5
 
-    def test_kk_ffd_fallback(self):
-        """Verify KK falls back to FFD when partition violates capacity.
-
-        Tight capacity + balanced partition forces a group sum > capacity.
-        """
+    def test_kk_respects_capacity_without_fallback(self):
+        """When KK naturally satisfies capacity, no FFD fallback is needed."""
         values = [250, 250, 250, 250]
         # total=1000, capacity=300 → k=ceil(1000/300)=4
-        # Each group gets exactly 250, so no fallback
+        # Each group gets exactly 250 ≤ 300 → no fallback
         result = kk_allocate(values, capacity=300, min_groups=2)
+        assert len(result) == 4
         for group in result:
             group_sum = sum(values[i] for i in group)
             assert group_sum <= 300
