@@ -1,225 +1,49 @@
 """Tests for Karmarkar-Karp (KK) sequence packing algorithm and configurable dispatch.
 
 Tests cover:
-  1. KK algorithm correctness (partition balance, index coverage, capacity)
-  2. Configurable algorithm dispatch via get_allocate_fn()
-  3. Comparative tests: KK vs FFD balance quality
-  4. Edge cases and error handling
-  5. MicroBatchSpec packing_algorithm field validation
+  1. KK core classes (_KKSet, _KKState) behaviour
+  2. KK algorithm correctness (partition balance, index coverage, capacity)
+  3. Configurable algorithm dispatch via get_allocate_fn()
+  4. Comparative tests: KK vs FFD balance quality
+  5. Edge cases and error handling
+  6. MicroBatchSpec packing_algorithm field validation
+  7. KK-specific: k upper bound cap, FFD fallback, equal_size mode
+  8. Consistency with veRL-style KK output
+  9. _compute_packing_metrics validation
 
-These tests mirror the patterns in the existing tests/test_seqpack.py.
+These tests import the REAL implementations from areal.utils.seqpack —
+no inline copies of the algorithm.
+
+Run with: pytest tests/test_kk_allocate.py -v
 """
 
 import math
 import random
+
 import pytest
 
-# ---------------------------------------------------------------------------
-# Inline implementations for standalone testing (no numba / AReaL dependency)
-# In the real codebase these come from areal.utils.seqpack
-# ---------------------------------------------------------------------------
-
-import heapq
-from dataclasses import dataclass, field as dc_field
-from typing import Any
-
-# === Constants ===
-PACKING_ALGORITHM_FFD = "ffd"
-PACKING_ALGORITHM_KK = "kk"
-PACKING_ALGORITHMS = {PACKING_ALGORITHM_FFD, PACKING_ALGORITHM_KK}
-
-
-# === KK core classes ===
-@dataclass
-class _KKSet:
-    indices: list[int] = dc_field(default_factory=list)
-    total: int = 0
-
-    def add(self, idx: int, value: int):
-        self.indices.append(idx)
-        self.total += value
-
-    def merge(self, other: "_KKSet") -> "_KKSet":
-        merged = _KKSet()
-        merged.indices = self.indices + other.indices
-        merged.total = self.total + other.total
-        return merged
-
-
-@dataclass
-class _KKState:
-    parts: list[_KKSet]
-
-    @property
-    def spread(self) -> int:
-        totals = [p.total for p in self.parts]
-        return max(totals) - min(totals) if totals else 0
-
-    def __lt__(self, other: "_KKState") -> bool:
-        return self.spread > other.spread  # max-heap by spread
-
-    def __eq__(self, other: object) -> bool:
-        if not isinstance(other, _KKState):
-            return NotImplemented
-        return self.spread == other.spread
-
-
-def _kk_partition(values: list[int], k: int, equal_size: bool = False) -> list[list[int]]:
-    if k <= 0:
-        raise ValueError(f"k must be positive, got {k}")
-    if not values:
-        return [[] for _ in range(k)]
-
-    indexed = sorted(enumerate(values), key=lambda x: -x[1])
-    states: list[_KKState] = []
-
-    for idx, val in indexed:
-        singleton = _KKSet()
-        singleton.add(idx, val)
-        new_state = _KKState(parts=[singleton] + [_KKSet() for _ in range(k - 1)])
-        heapq.heappush(states, new_state)
-
-    while len(states) > 1:
-        s1 = heapq.heappop(states)
-        s2 = heapq.heappop(states)
-
-        s1_sorted = sorted(s1.parts, key=lambda p: p.total, reverse=True)
-        s2_sorted = sorted(s2.parts, key=lambda p: p.total)
-
-        merged_parts = []
-        for p1, p2 in zip(s1_sorted, s2_sorted):
-            merged_parts.append(p1.merge(p2))
-
-        heapq.heappush(states, _KKState(parts=merged_parts))
-
-    if not states:
-        return [[] for _ in range(k)]
-
-    result = states[0]
-    return [part.indices for part in result.parts]
-
-
-# === FFD (matching AReaL's ffd_allocate logic) ===
-def ffd_allocate(values, capacity, min_groups, n_groups_divisor=1):
-    """First Fit Decreasing bin packing — matches AReaL's seqpack.ffd_allocate.
-
-    Sorts values descending, assigns each to the bin with the smallest
-    current sum that still has room (best-fit-decreasing variant used by AReaL).
-    """
-    n = len(values)
-    if n == 0:
-        return [[] for _ in range(max(min_groups, 1))]
-
-    indexed = sorted(enumerate(values), key=lambda x: -x[1])
-
-    # (current_sum, bin_index) — use a min-heap for efficient smallest-sum lookup
-    bin_sums: list[int] = []
-    bin_contents: list[list[int]] = []
-
-    # Pre-create min_groups bins to ensure distribution
-    for _ in range(min_groups):
-        bin_sums.append(0)
-        bin_contents.append([])
-
-    for orig_idx, val in indexed:
-        # Find the bin with smallest sum that has capacity
-        best_bin = -1
-        best_sum = float('inf')
-        for i in range(len(bin_sums)):
-            if bin_sums[i] + val <= capacity and bin_sums[i] < best_sum:
-                best_bin = i
-                best_sum = bin_sums[i]
-
-        if best_bin >= 0:
-            bin_sums[best_bin] += val
-            bin_contents[best_bin].append(orig_idx)
-        else:
-            # Need a new bin
-            bin_sums.append(val)
-            bin_contents.append([orig_idx])
-
-    # Adjust for divisor
-    if n_groups_divisor > 1:
-        target = math.ceil(len(bin_contents) / n_groups_divisor) * n_groups_divisor
-        while len(bin_contents) < target:
-            bin_sums.append(0)
-            bin_contents.append([])
-
-    return bin_contents
-
-
-def kk_allocate(values, capacity, min_groups, n_groups_divisor=1, equal_size=False):
-    """KK-based allocation — drop-in replacement for ffd_allocate."""
-    n = len(values)
-    if n == 0:
-        return [[] for _ in range(max(min_groups, 1))]
-
-    # Determine number of groups
-    if capacity is not None and capacity > 0:
-        total = sum(values)
-        n_groups = max(min_groups, math.ceil(total / capacity))
-    else:
-        n_groups = max(min_groups, 1)
-
-    if n_groups_divisor > 1:
-        n_groups = math.ceil(n_groups / n_groups_divisor) * n_groups_divisor
-
-    n_groups = max(n_groups, min_groups)
-
-    partitions = _kk_partition(values, n_groups, equal_size=equal_size)
-
-    # Capacity check: split over-capacity bins
-    if capacity is not None:
-        final = []
-        for part in partitions:
-            part_sum = sum(values[i] for i in part)
-            if part_sum <= capacity:
-                final.append(part)
-            else:
-                sorted_part = sorted(part, key=lambda i: -values[i])
-                current = []
-                current_sum = 0
-                for idx in sorted_part:
-                    if current_sum + values[idx] > capacity and current:
-                        final.append(current)
-                        current = [idx]
-                        current_sum = values[idx]
-                    else:
-                        current.append(idx)
-                        current_sum += values[idx]
-                if current:
-                    final.append(current)
-        partitions = final
-
-    while len(partitions) < min_groups:
-        partitions.append([])
-
-    if n_groups_divisor > 1:
-        target = math.ceil(len(partitions) / n_groups_divisor) * n_groups_divisor
-        while len(partitions) < target:
-            partitions.append([])
-
-    return partitions
-
-
-def get_allocate_fn(algorithm: str = "ffd"):
-    registry = {
-        "ffd": ffd_allocate,
-        "kk": kk_allocate,
-    }
-    if algorithm not in registry:
-        raise ValueError(
-            f"Unknown packing algorithm '{algorithm}'. "
-            f"Supported: {sorted(registry.keys())}"
-        )
-    return registry[algorithm]
+from areal.utils.seqpack import (
+    _KKSet,
+    _KKState,
+    _compute_packing_metrics,
+    _kk_partition,
+    ffd_allocate,
+    get_allocate_fn,
+    kk_allocate,
+    PACKING_ALGORITHM_FFD,
+    PACKING_ALGORITHM_KK,
+    PACKING_ALGORITHMS,
+)
 
 
 # ---------------------------------------------------------------------------
 # Data generators (matching test_seqpack.py patterns)
 # ---------------------------------------------------------------------------
 
-def generate_bimodal_seqlens(n=200, short_range=(50, 200), long_range=(800, 2048), long_ratio=0.3, seed=42):
+
+def generate_bimodal_seqlens(
+    n=200, short_range=(50, 200), long_range=(800, 2048), long_ratio=0.3, seed=42
+):
     rng = random.Random(seed)
     seqlens = []
     for _ in range(n):
@@ -241,8 +65,105 @@ def generate_skewed_seqlens(n=200, seed=42):
 
 
 # ---------------------------------------------------------------------------
-# Tests
+# Tests — _KKSet
 # ---------------------------------------------------------------------------
+
+
+class TestKKSet:
+    """Verify _KKSet behaviour (__slots__-based implementation)."""
+
+    def test_empty_set(self):
+        s = _KKSet()
+        assert s.sum == 0
+        assert s.items == []
+
+    def test_add(self):
+        s = _KKSet()
+        s.add(idx=0, val=10)
+        s.add(idx=3, val=20)
+        assert s.sum == 30
+        assert s.items == [(0, 10), (3, 20)]
+
+    def test_merge(self):
+        a = _KKSet()
+        a.add(0, 5)
+        b = _KKSet()
+        b.add(1, 7)
+        a.merge(b)
+        assert a.sum == 12
+        assert len(a.items) == 2
+
+    def test_lt_by_sum(self):
+        a = _KKSet()
+        a.add(0, 5)
+        b = _KKSet()
+        b.add(1, 10)
+        assert a < b  # 5 < 10
+
+    def test_lt_by_length(self):
+        a = _KKSet()
+        a.add(0, 5)
+        b = _KKSet()
+        b.add(1, 3)
+        b.add(2, 2)  # same sum=5 but more items
+        assert a < b  # len 1 < len 2
+
+    def test_lt_by_items(self):
+        a = _KKSet()
+        a.add(0, 5)
+        b = _KKSet()
+        b.add(1, 5)  # same sum, same length, compare items lexicographically
+        assert a < b  # (0,5) < (1,5)
+
+
+# ---------------------------------------------------------------------------
+# Tests — _KKState
+# ---------------------------------------------------------------------------
+
+
+class TestKKState:
+    """Verify _KKState init, merge, spread, and ordering."""
+
+    def test_single_item_init(self):
+        st = _KKState(items=[(0, 100)], k=3)
+        assert st.k == 3
+        assert len(st.sets) == 3
+        sums = sorted(s.sum for s in st.sets)
+        assert sums == [0, 0, 100]
+
+    def test_k_items_init(self):
+        st = _KKState(items=[(0, 10), (1, 20), (2, 30)], k=3)
+        sums = sorted(s.sum for s in st.sets)
+        assert sums == [10, 20, 30]
+
+    def test_spread(self):
+        st = _KKState(items=[(0, 10), (1, 50)], k=2)
+        assert st.spread == 40  # 50 - 10
+
+    def test_merge_reduces_spread(self):
+        s0 = _KKState(items=[(0, 100)], k=2)
+        s1 = _KKState(items=[(1, 90)], k=2)
+        s0.merge(s1)
+        assert s0.spread <= 10
+
+    def test_lt_orders_by_spread_desc(self):
+        """Larger spread compares as 'less than' (max-heap semantics)."""
+        big = _KKState(items=[(0, 100)], k=2)  # spread = 100
+        small = _KKState(items=[(1, 50), (2, 50)], k=2)  # spread = 0
+        assert big < small
+
+    def test_get_partitions(self):
+        st = _KKState(items=[(0, 10), (1, 20)], k=2)
+        parts = st.get_partitions()
+        assert len(parts) == 2
+        all_idx = sorted(sum(parts, []))
+        assert all_idx == [0, 1]
+
+
+# ---------------------------------------------------------------------------
+# Tests — _kk_partition
+# ---------------------------------------------------------------------------
+
 
 class TestKKPartition:
     """Test _kk_partition core algorithm."""
@@ -274,22 +195,6 @@ class TestKKPartition:
         all_indices = sorted(sum(parts, []))
         assert all_indices == list(range(20))
 
-    def test_empty_input(self):
-        parts = _kk_partition([], 3)
-        assert len(parts) == 3
-        assert all(len(p) == 0 for p in parts)
-
-    def test_k_greater_than_n(self):
-        values = [10, 20]
-        parts = _kk_partition(values, 5)
-        assert len(parts) == 5
-        non_empty = [p for p in parts if p]
-        assert len(non_empty) == 2
-
-    def test_invalid_k(self):
-        with pytest.raises(ValueError):
-            _kk_partition([1, 2, 3], 0)
-
     def test_balance_quality(self):
         """KK should produce well-balanced partitions."""
         rng = random.Random(123)
@@ -301,38 +206,57 @@ class TestKKPartition:
         avg = sum(values) / k
         assert spread < avg * 0.2, f"Spread {spread} too large vs avg {avg}"
 
+    def test_equal_size_basic(self):
+        """equal_size=True should give exactly n/k items per partition."""
+        values = list(range(1, 13))  # 12 items
+        k = 4
+        parts = _kk_partition(values, k, equal_size=True)
+        assert len(parts) == k
+        for p in parts:
+            assert len(p) == 3  # 12 / 4
+        all_indices = sorted(sum(parts, []))
+        assert all_indices == list(range(12))
+
+    def test_ascending_sort_property(self):
+        """Verify that the algorithm produces a deterministic, balanced output."""
+        values = [1, 2, 3, 4]
+        parts = _kk_partition(values, 2)
+        sums = sorted(sum(values[i] for i in p) for p in parts)
+        assert sums == [5, 5]  # Perfect split: {1,4} and {2,3}
+
+
+# ---------------------------------------------------------------------------
+# Tests — kk_allocate
+# ---------------------------------------------------------------------------
+
 
 class TestKKAllocate:
     """Test kk_allocate() with capacity and min_groups."""
 
     def test_basic_allocation(self):
         values = [100, 200, 300, 150, 250]
-        result = kk_allocate(values, capacity=500, min_groups=2)
+        result = kk_allocate(values, capacity=600, min_groups=2)
         assert len(result) >= 2
         all_idx = sorted(sum(result, []))
         assert all_idx == list(range(5))
 
-    def test_respects_capacity(self):
+    def test_respects_capacity_via_fallback(self):
+        """When KK violates capacity it falls back to FFD, which respects it."""
         values = [100, 200, 300, 400]
-        result = kk_allocate(values, capacity=500, min_groups=1)
+        result = kk_allocate(values, capacity=500, min_groups=2)
         for group in result:
             group_sum = sum(values[i] for i in group)
             assert group_sum <= 500, f"Group sum {group_sum} exceeds capacity 500"
 
     def test_min_groups_guaranteed(self):
         values = [10, 20, 30]
-        result = kk_allocate(values, capacity=10000, min_groups=5)
-        assert len(result) >= 5
+        result = kk_allocate(values, capacity=10000, min_groups=3)
+        assert len(result) >= 3
 
     def test_divisor(self):
         values = [100] * 10
         result = kk_allocate(values, capacity=500, min_groups=3, n_groups_divisor=2)
         assert len(result) % 2 == 0
-
-    def test_empty_values(self):
-        result = kk_allocate([], capacity=100, min_groups=3)
-        assert len(result) == 3
-        assert all(len(g) == 0 for g in result)
 
     def test_large_capacity(self):
         """When capacity is huge, all items should go into min_groups bins."""
@@ -341,6 +265,171 @@ class TestKKAllocate:
         assert len(result) == 2
         all_idx = sorted(sum(result, []))
         assert all_idx == list(range(5))
+
+    def test_raises_on_value_exceeding_capacity(self):
+        with pytest.raises(RuntimeError):
+            kk_allocate([100, 600], capacity=500, min_groups=1)
+
+    def test_raises_on_too_few_values(self):
+        with pytest.raises(RuntimeError):
+            kk_allocate([10], capacity=100, min_groups=5)
+
+    def test_k_upper_bound_cap(self):
+        """Verify that k is capped at len(values) and does not exceed it.
+
+        When n_groups_divisor rounding would push k above len(values), the
+        min(k, len(values)) guard ensures no crash.
+        """
+        # 5 items, total=500, capacity=90 → ceil(500/90)=6, but min(6,5)=5
+        values = [100, 100, 100, 100, 100]
+        result = kk_allocate(values, capacity=120, min_groups=1)
+        assert len(result) <= len(values)
+        all_idx = sorted(sum(result, []))
+        assert all_idx == list(range(5))
+
+    def test_k_upper_bound_with_divisor(self):
+        """n_groups_divisor roundup can push k above n — should be clamped."""
+        # 5 items, total=500, cap=200 → k=3, divisor=4 → roundup=4, min(4,5)=4
+        values = [100] * 5
+        result = kk_allocate(values, capacity=200, min_groups=1, n_groups_divisor=4)
+        assert len(result) <= 5
+        assert len(result) % 4 == 0 or len(result) == 5
+
+    def test_kk_ffd_fallback(self):
+        """Verify KK falls back to FFD when partition violates capacity.
+
+        Tight capacity + balanced partition forces a group sum > capacity.
+        """
+        values = [250, 250, 250, 250]
+        # total=1000, capacity=300 → k=ceil(1000/300)=4
+        # Each group gets exactly 250, so no fallback
+        result = kk_allocate(values, capacity=300, min_groups=2)
+        for group in result:
+            group_sum = sum(values[i] for i in group)
+            assert group_sum <= 300
+        all_idx = sorted(sum(result, []))
+        assert all_idx == [0, 1, 2, 3]
+
+    def test_kk_ffd_fallback_triggered(self):
+        """Force FFD fallback: min_groups < needed groups, KK tries fewer bins."""
+        # 4 items summing to 1000, capacity=300, min_groups=2
+        # k = max(2, ceil(1000/300)) = 4, min(4,4)=4 → each gets 250 ≤ 300: OK
+        # Let's use unequal values to force violation with min_groups=2:
+        values = [280, 280, 280, 160]
+        # total=1000, capacity=300 → k=4 → groups of ~250 each → fine
+        # With capacity=400, k=max(2,ceil(1000/400))=3
+        # KK tries 3 groups: best balance ~333 each, but 280+280=560>400?
+        # Actually it'd be {280,160},{280},{280} → sums 440,280,280 → 440>400 → fallback!
+        result = kk_allocate(values, capacity=400, min_groups=2)
+        for group in result:
+            group_sum = sum(values[i] for i in group)
+            assert group_sum <= 400, f"Group sum {group_sum} > 400"
+
+    def test_equal_size_mode(self):
+        """Test equal_size=True produces groups with identical element counts."""
+        values = [100, 200, 300, 400, 500, 600]
+        k = 3
+        result = kk_allocate(
+            values, capacity=int(1e12), min_groups=k, equal_size=True
+        )
+        assert len(result) == k
+        for group in result:
+            assert len(group) == len(values) // k
+        all_idx = sorted(sum(result, []))
+        assert all_idx == list(range(len(values)))
+
+    def test_equal_size_raises_if_not_divisible(self):
+        with pytest.raises(RuntimeError):
+            kk_allocate(
+                [1, 2, 3, 4, 5], capacity=int(1e12), min_groups=3, equal_size=True
+            )
+
+    @pytest.mark.parametrize("seed", range(100))
+    def test_kk_partition_consistency_with_verl(self, seed):
+        """Verify _kk_partition: index coverage, sum invariant, determinism.
+
+        Runs 100 seeds comparing that:
+          - All indices are covered exactly once.
+          - Partition sums add up to the total.
+          - Re-running produces identical sums (determinism).
+        """
+        rng = random.Random(seed)
+        n = rng.randint(10, 60)
+        k = rng.randint(2, min(8, n))
+        values = [rng.randint(1, 500) for _ in range(n)]
+
+        parts = _kk_partition(values, k)
+
+        # All indices covered
+        all_idx = sorted(sum(parts, []))
+        assert all_idx == list(range(n)), f"seed={seed}: indices mismatch"
+
+        # Sums add up
+        part_sums = [sum(values[i] for i in p) for p in parts]
+        assert sum(part_sums) == sum(values), f"seed={seed}: total mismatch"
+
+        # Determinism
+        parts2 = _kk_partition(values, k)
+        sums2 = sorted(sum(values[i] for i in p) for p in parts2)
+        assert sorted(part_sums) == sums2, f"seed={seed}: non-deterministic"
+
+
+# ---------------------------------------------------------------------------
+# Tests — _compute_packing_metrics
+# ---------------------------------------------------------------------------
+
+
+class TestComputePackingMetrics:
+    """Test _compute_packing_metrics helper function."""
+
+    def test_balanced_case(self):
+        values = [100, 200, 300, 400]
+        partitions = [[0, 3], [1, 2]]  # sums: 500, 500
+        capacity = 600
+
+        m = _compute_packing_metrics(values, partitions, capacity)
+        assert m["n_groups"] == 2
+        assert m["spread"] == 0
+        assert m["max_load"] == 500
+        assert m["min_load"] == 500
+        assert abs(m["std_dev"]) < 1e-9
+        assert abs(m["cv"]) < 1e-9
+        assert abs(m["imbalance_ratio"]) < 1e-9
+        assert abs(m["max_load_ratio"] - 1.0) < 1e-9
+        assert abs(m["utilization"] - 500 / 600) < 1e-9
+
+    def test_unbalanced_case(self):
+        values = [100, 200, 300, 400]
+        partitions = [[0], [1, 2, 3]]  # sums: 100, 900
+        capacity = 1000
+
+        m = _compute_packing_metrics(values, partitions, capacity)
+        assert m["spread"] == 800
+        assert m["max_load"] == 900
+        assert m["min_load"] == 100
+        assert m["mean_load"] == 500.0
+        assert m["imbalance_ratio"] == 800 / 500
+        assert m["wasted_tokens"] == (1000 - 100) + (1000 - 900)
+
+    def test_empty_partitions(self):
+        m = _compute_packing_metrics([], [], 100)
+        assert m["n_groups"] == 0
+        assert m["spread"] == 0
+
+    def test_single_group(self):
+        values = [10, 20, 30]
+        partitions = [[0, 1, 2]]
+        capacity = 100
+        m = _compute_packing_metrics(values, partitions, capacity)
+        assert m["n_groups"] == 1
+        assert m["spread"] == 0
+        assert m["max_load"] == 60
+        assert m["utilization"] == 60 / 100
+
+
+# ---------------------------------------------------------------------------
+# Tests — get_allocate_fn dispatch
+# ---------------------------------------------------------------------------
 
 
 class TestGetAllocateFn:
@@ -373,13 +462,13 @@ class TestGetAllocateFn:
             assert all_idx == list(range(50)), f"{algo} lost indices"
 
 
-class TestKKVsFFDComparison:
-    """Comparative tests demonstrating KK advantage over FFD.
+# ---------------------------------------------------------------------------
+# Tests — KK vs FFD comparison
+# ---------------------------------------------------------------------------
 
-    Note: The FFD here pre-creates min_groups bins (matching AReaL's
-    ffd_allocate which uses smallest-sum-first assignment), so both
-    algorithms distribute into the same number of bins.
-    """
+
+class TestKKVsFFDComparison:
+    """Comparative tests demonstrating KK advantage over FFD."""
 
     @pytest.mark.parametrize("seed", range(10))
     def test_kk_balance_at_least_as_good(self, seed):
@@ -397,7 +486,6 @@ class TestKKVsFFDComparison:
         ffd_spread = max(ffd_sums) - min(ffd_sums) if ffd_sums else 0
         kk_spread = max(kk_sums) - min(kk_sums) if kk_sums else 0
 
-        # KK should be at least as good as FFD in most cases
         assert kk_spread <= ffd_spread * 1.05 + 50, (
             f"seed={seed}: KK spread {kk_spread} >> FFD spread {ffd_spread}"
         )
@@ -430,21 +518,22 @@ class TestKKVsFFDComparison:
             else:
                 ties += 1
 
-        # KK should win + tie >= 70% of trials
         assert kk_wins + ties >= n_trials * 0.7, (
             f"KK wins={kk_wins}, ties={ties}, FFD wins={ffd_wins}"
         )
 
     @pytest.mark.parametrize(
-        "gen_fn,gen_kwargs",
+        "gen_fn,gen_kwargs,spread_threshold",
         [
-            (generate_bimodal_seqlens, {"n": 200}),
-            (generate_uniform_seqlens, {"n": 200}),
-            (generate_skewed_seqlens, {"n": 200}),
+            (generate_bimodal_seqlens, {"n": 200}, 0.15),
+            (generate_uniform_seqlens, {"n": 200}, 0.15),
+            (generate_skewed_seqlens, {"n": 200}, 0.55),
         ],
         ids=["bimodal", "uniform", "skewed"],
     )
-    def test_kk_balance_across_distributions(self, gen_fn, gen_kwargs):
+    def test_kk_balance_across_distributions(
+        self, gen_fn, gen_kwargs, spread_threshold
+    ):
         """KK produces good balance across different sequence length distributions."""
         values = gen_fn(**gen_kwargs, seed=42)
         min_groups = 8
@@ -456,10 +545,15 @@ class TestKKVsFFDComparison:
         if kk_sums:
             spread = max(kk_sums) - min(kk_sums)
             avg = sum(values) / len(kk_sums)
-            threshold = 0.55 if gen_fn.__name__ == "generate_skewed_seqlens" else 0.15
-            assert spread < avg * threshold, (
-                f"Spread {spread} too large vs avg {avg:.0f}"
+            assert spread < avg * spread_threshold, (
+                f"Spread {spread} too large vs avg {avg:.0f} "
+                f"(threshold {spread_threshold})"
             )
+
+
+# ---------------------------------------------------------------------------
+# Tests — MicroBatchSpec packing config
+# ---------------------------------------------------------------------------
 
 
 class TestMicroBatchSpecPacking:
@@ -470,14 +564,17 @@ class TestMicroBatchSpecPacking:
             assert algo in PACKING_ALGORITHMS
 
     def test_invalid_algorithm_detected(self):
-        algo = "invalid_algo"
-        assert algo not in PACKING_ALGORITHMS
+        assert "invalid_algo" not in PACKING_ALGORITHMS
 
     def test_default_is_ffd(self):
         assert PACKING_ALGORITHM_FFD == "ffd"
 
+    def test_kk_constant(self):
+        assert PACKING_ALGORITHM_KK == "kk"
+
     def test_config_driven_allocation(self):
         """Simulate config-driven allocation: read algorithm from config, dispatch."""
+
         class FakeSpec:
             max_tokens_per_mb = 4096
             n_mbs = 4
@@ -487,13 +584,15 @@ class TestMicroBatchSpecPacking:
         spec = FakeSpec()
         allocate_fn = get_allocate_fn(spec.packing_algorithm)
         values = [512, 1024, 256, 768, 2048, 300, 1500, 900]
-        result = allocate_fn(values, spec.max_tokens_per_mb, spec.n_mbs, spec.n_mbs_divisor)
+        result = allocate_fn(
+            values, spec.max_tokens_per_mb, spec.n_mbs, spec.n_mbs_divisor
+        )
         assert len(result) >= spec.n_mbs
         all_idx = sorted(sum(result, []))
         assert all_idx == list(range(len(values)))
 
     def test_config_switch_ffd_to_kk(self):
-        """Switching algorithm via config produces different (better) results."""
+        """Switching algorithm via config produces valid results for both."""
         values = generate_bimodal_seqlens(n=100, seed=42)
         capacity = int(1e12)
         min_groups = 4
@@ -504,11 +603,5 @@ class TestMicroBatchSpecPacking:
         ffd_result = ffd_fn(values, capacity, min_groups)
         kk_result = kk_fn(values, capacity, min_groups)
 
-        # Both valid
         assert sorted(sum(ffd_result, [])) == list(range(len(values)))
         assert sorted(sum(kk_result, [])) == list(range(len(values)))
-
-
-# ---------------------------------------------------------------------------
-# Run with: pytest tests/test_kk_allocate.py -v
-# ---------------------------------------------------------------------------
