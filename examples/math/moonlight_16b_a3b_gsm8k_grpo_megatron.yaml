@@ -39,7 +39,7 @@ gconfig:
   temperature: 1.0
 
 actor:
-  backend: "megatron:(attn:d1p1t8|ffn:d1p1t1e8)"
+  backend: "megatron:(attn:d1p2t4|ffn:d1p2t1e4)"    # ← PP=2 回退，TP=4/EP=4
   experiment_name: ${experiment_name}
   trial_name: ${trial_name}
   path: /workspace/models/Moonlight-16B-A3B-Instruct
@@ -48,7 +48,7 @@ actor:
   gradient_checkpointing: true
   dtype: bfloat16
   mb_spec:
-    max_tokens_per_mb: 2048
+    max_tokens_per_mb: 512                             # ← 从 2048 降至 512
   optimizer:
     type: adam_bf16
     lr: 5e-6
@@ -64,7 +64,7 @@ actor:
   reward_scaling: 10.0
   reward_bias: -0.5
   kl_ctl: 0.0
-  ppo_n_minibatches: 1
+  ppo_n_minibatches: 4                                # ← 从 1 提高至 4（分批梯度累积）
   recompute_logprob: true
   use_decoupled_loss: true
   behave_imp_weight_cap: 5.0
@@ -81,7 +81,7 @@ actor:
     use_deterministic_algorithms: false
     recompute_granularity: full
     recompute_method: uniform
-    recompute_num_layers: 1
+    recompute_num_layers: 1                            # ← 保持逐层重计算
   scheduling_spec:
     - task_type: worker
       port_count: 2
