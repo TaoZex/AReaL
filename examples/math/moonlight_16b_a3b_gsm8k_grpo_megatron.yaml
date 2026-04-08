@@ -48,7 +48,7 @@ actor:
   gradient_checkpointing: true
   dtype: bfloat16
   mb_spec:
-    max_tokens_per_mb: 512                             # ← 从 2048 降至 512
+    max_tokens_per_mb: 1280                             # ← 从 2048 降至 512
   optimizer:
     type: adam_bf16
     lr: 5e-6
@@ -99,7 +99,7 @@ ref:
   disable_dropout: true
   dtype: ${actor.dtype}
   mb_spec:
-    max_tokens_per_mb: 512
+    max_tokens_per_mb: 1280
   optimizer: null
   scheduling_strategy:
     type: colocation
