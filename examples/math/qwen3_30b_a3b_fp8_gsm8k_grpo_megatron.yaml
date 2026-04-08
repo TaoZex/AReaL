@@ -81,10 +81,10 @@ actor:
     use_deterministic_algorithms: true
     fp8_config:
       mode: hybrid
-      recipe: blockwise
-      param: true
+      recipe: delayed
+      param: false
     ddp:
-      fp8_param_gather: true
+      fp8_param_gather: false
     recompute_granularity: full
     recompute_method: uniform
     recompute_num_layers: 24
