@@ -121,10 +121,9 @@ class DistRolloutCoordinator:
             Redistributed and broadcast batch available on all ranks (list of trajs)
         """
         if trajectories is not None:
-            packing_algorithm = getattr(
-                getattr(self.train_engine, "config", None), "mb_spec", None
-            )
-            packing_algorithm = getattr(packing_algorithm, "packing_algorithm", "ffd")
+            config = getattr(self.train_engine, "config", None)
+            mb_spec = getattr(config, "mb_spec", None)
+            packing_algorithm = getattr(mb_spec, "packing_algorithm", "ffd")
             redist = redistribute_trajectories(
                 trajectories,
                 group=self.train_engine.data_parallel_group,

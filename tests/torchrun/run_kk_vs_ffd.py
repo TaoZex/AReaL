@@ -22,22 +22,17 @@ from areal.utils.seqpack import ffd_allocate, kk_allocate
 
 def redistribute_trajectories_sim(seqlens, world_size, algorithm="ffd"):
     """Simulate trajectory redistribution: allocate seqlens to ranks.
-
     Uses the *real* kk_allocate / ffd_allocate from areal.utils.seqpack.
-    Groups are assigned to the least-loaded rank (round-robin by load).
+    This simulation mirrors the production logic where rank `i` takes group `i`.
     """
     allocate_fn = kk_allocate if algorithm == "kk" else ffd_allocate
     groups = allocate_fn(seqlens, capacity=int(1e12), min_groups=world_size)
-
-    rank_loads = [0] * world_size
-    rank_indices = [[] for _ in range(world_size)]
-
-    for group in groups:
-        min_rank = min(range(world_size), key=lambda r: rank_loads[r])
-        rank_indices[min_rank].extend(group)
-        rank_loads[min_rank] += sum(seqlens[i] for i in group)
-
-    return rank_indices, rank_loads
+    # Production logic maps group `i` to rank `i`. We calculate all rank loads.
+    rank_indices = groups
+    rank_loads = [sum(seqlens[i] for i in group) for group in groups]
+    # Pad with zeros if fewer groups than ranks are returned, and truncate if more.
+    final_loads = (rank_loads + [0] * world_size)[:world_size]
+    return rank_indices, final_loads
 
 
 # =====================================================================
