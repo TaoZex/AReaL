@@ -90,7 +90,9 @@ actor:
     # main_grads_dtype: bfloat16
     # # adam_bf16 已自动设置以下两项，但显式声明更安全
     # exp_avg_dtype: bfloat16
-    # exp_avg_sq_dtype: bfloat16                     # ← 保持逐层重计算
+    # exp_avg_sq_dtype: bfloat16 
+    ddp:
+      grad_reduce_in_fp32: false                    # ← 保持逐层重计算
   scheduling_spec:
     - task_type: worker
       port_count: 2

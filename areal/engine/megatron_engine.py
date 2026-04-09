@@ -1010,6 +1010,21 @@ class MegatronEngine(TrainEngine):
         )
         # for run moe
         mcore_opt_config.store_param_remainders = True
+        import logging as _logging
+        _opt_logger = _logging.getLogger('AReaL.OptDiag')
+        _opt_logger.warning(
+            f'[OptDiag] Megatron OptimizerConfig: '
+            f'use_precision_aware_optimizer={mcore_opt_config.use_precision_aware_optimizer}, '
+            f'use_precision_aware_optimizer_no_fp8_or_ds_fp8='
+            f'{getattr(mcore_opt_config, "use_precision_aware_optimizer_no_fp8_or_ds_fp8", "N/A")}, '
+            f'store_param_remainders={mcore_opt_config.store_param_remainders}, '
+            f'main_params_dtype={mcore_opt_config.main_params_dtype}, '
+            f'main_grads_dtype={mcore_opt_config.main_grads_dtype}, '   
+            f'exp_avg_dtype={mcore_opt_config.exp_avg_dtype}, '
+            f'exp_avg_sq_dtype={mcore_opt_config.exp_avg_sq_dtype}, '
+            f'use_distributed_optimizer={mcore_opt_config.use_distributed_optimizer}, '
+            f'bf16={mcore_opt_config.bf16}'
+        )
         self.optimizer = get_megatron_optimizer(mcore_opt_config, self.model)
 
         warmup_steps_proportion = self.optimizer_config.warmup_steps_proportion
