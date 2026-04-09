@@ -81,7 +81,12 @@ actor:
     use_deterministic_algorithms: false
     recompute_granularity: full
     recompute_method: uniform
-    recompute_num_layers: 1                            # ← 保持逐层重计算
+    recompute_num_layers: 1       
+    main_params_dtype: bfloat16
+    main_grads_dtype: bfloat16
+    # adam_bf16 已自动设置以下两项，但显式声明更安全
+    exp_avg_dtype: bfloat16
+    exp_avg_sq_dtype: bfloat16                     # ← 保持逐层重计算
   scheduling_spec:
     - task_type: worker
       port_count: 2
@@ -111,7 +116,7 @@ sglang:
   random_seed: ${seed}
   skip_tokenizer_init: true
   dtype: bfloat16
-  max_running_requests: 16
+  max_running_requests: 8
   context_length: 2048
   mem_fraction_static: 0.25
   attention_backend: triton
