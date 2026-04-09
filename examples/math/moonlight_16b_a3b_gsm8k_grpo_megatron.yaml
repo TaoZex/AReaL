@@ -118,7 +118,7 @@ sglang:
   dtype: bfloat16
   max_running_requests: 8
   context_length: 2048
-  mem_fraction_static: 0.25
+  mem_fraction_static: 0.2
   attention_backend: triton
 
 vllm:
