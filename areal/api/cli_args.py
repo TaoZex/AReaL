@@ -2246,6 +2246,10 @@ class SchedulerConfig:
 class _DatasetConfig:
     """Configuration for dataset loading and preprocessing."""
 
+    split: str = field(
+        default="train",
+        metadata={"help": "Dataset split to use, e.g., 'train', 'test'."},
+    )
     path: str = field(
         default=MISSING,
         metadata={
@@ -2271,6 +2275,12 @@ class _DatasetConfig:
     num_workers: int = field(
         default=0, metadata={"help": "Number of worker processes for data loading"}
     )
+    num_dataset_workers: int = field(
+        default=1,
+        metadata={
+            "help": "Number of remote data-service worker processes to launch when using scheduling_spec."
+        },
+    )
     drop_last: bool = field(
         default=True, metadata={"help": "Drop the last incomplete batch"}
     )
@@ -2278,6 +2288,22 @@ class _DatasetConfig:
         default=None,
         metadata={
             "help": "Maximum token length of sequences in dataset. Longer sequences are filtered out."
+        },
+    )
+    dataset_kwargs: dict[str, Any] = field(
+        default_factory=dict,
+        metadata={
+            "help": "Additional keyword arguments for dataset loading. "
+            "These are passed to the dataset loading function `get_custom_dataset`."
+        },
+    )
+    scheduling_spec: SchedulingSpec | None = field(
+        default_factory=lambda: SchedulingSpec(
+            cpu=1, gpu=0, mem=10, cmd="python3 -m areal.infra.rpc.guard"
+        ),
+        metadata={
+            "help": "Scheduling spec for remote data loading workers. "
+            "If set, dataset loading will be offloaded to a data service with remote workers."
         },
     )
 
@@ -2295,6 +2321,10 @@ class ValidDatasetConfig(_DatasetConfig):
     `shuffle` and `drop_last` default to False.
     """
 
+    split: str = field(
+        default="test",
+        metadata={"help": "Dataset split to use, e.g., 'train', 'test'."},
+    )
     shuffle: bool = field(
         default=False, metadata={"help": "Whether to shuffle the dataset"}
     )

@@ -20,6 +20,7 @@ import torch.distributed as dist
 
 from areal.utils.seqpack import ffd_allocate, kk_allocate
 
+
 def redistribute_trajectories_sim(seqlens, world_size, algorithm="ffd"):
     """Simulate trajectory redistribution: allocate seqlens to ranks.
     Uses the *real* kk_allocate / ffd_allocate from areal.utils.seqpack.
