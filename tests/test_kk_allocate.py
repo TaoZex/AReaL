@@ -11,9 +11,6 @@ Tests cover:
   8. Consistency with veRL-style KK output
   9. _compute_packing_metrics validation
 
-These tests import the REAL implementations from areal.utils.seqpack —
-no inline copies of the algorithm.
-
 Run with: pytest tests/test_kk_allocate.py -v
 """
 

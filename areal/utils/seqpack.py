@@ -263,8 +263,6 @@ def ffd_allocate(
 # a common objective for balancing GPU workloads in RL training.
 #
 # References:
-#   - veRL:  https://github.com/verl-project/verl  (verl/utils/seqlen_balancing.py)
-#   - SLIME: https://github.com/THUDM/slime
 #   - R.E. Korf, "Multi-Way Number Partitioning", IJCAI 2009
 # =============================================================================
 

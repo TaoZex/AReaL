@@ -18,13 +18,7 @@ import random
 
 import torch.distributed as dist
 
-# Import real implementations — no inline copies
 from areal.utils.seqpack import ffd_allocate, kk_allocate
-
-# =====================================================================
-# Simulated redistribute_trajectories (mirrors dist_rollout.py logic)
-# =====================================================================
-
 
 def redistribute_trajectories_sim(seqlens, world_size, algorithm="ffd"):
     """Simulate trajectory redistribution: allocate seqlens to ranks.
