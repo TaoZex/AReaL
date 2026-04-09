@@ -85,7 +85,7 @@ actor:
     main_grads_dtype: bfloat16       # 梯度从 FP32 降为 BF16（节省 ~4 GiB）
     # store_param_remainders: true 
     # optimizer_cpu_offload: true
-    optimizer_offload_fraction: 0.5
+    # optimizer_offload_fraction: 0.5
     # main_params_dtype: bfloat16
     # main_grads_dtype: bfloat16
     # # adam_bf16 已自动设置以下两项，但显式声明更安全
