@@ -274,23 +274,23 @@ class TestKKAllocate:
         with pytest.raises(RuntimeError):
             kk_allocate([10], capacity=100, min_groups=5)
 
-def test_k_upper_bound_cap(self):
-    """Verify k = min(k, len(values)) prevents k from exceeding n.
+    def test_k_upper_bound_cap(self):
+        """Verify k = min(k, len(values)) prevents k from exceeding n.
 
-    With 10 items summing to 1000, capacity=120 → ceil(1000/120)=9,
-    n_groups_divisor=8 → roundup to 16, but min(16, 10) = 10.
-    """
-    # 10 items, total=1000, cap=120 → k=9, roundup(8)=16, cap→min(16,10)=10
-    values = [100] * 10
-    result = kk_allocate(values, capacity=120, min_groups=1, n_groups_divisor=8)
-    # k was capped from 16 → 10 (= len(values))
-    assert len(result) == 10
-    all_idx = sorted(sum(result, []))
-    assert all_idx == list(range(10))
+        With 10 items summing to 1000, capacity=120 → ceil(1000/120)=9,
+        n_groups_divisor=8 → roundup to 16, but min(16, 10) = 10.
+        """
+        # 10 items, total=1000, cap=120 → k=9, roundup(8)=16, cap→min(16,10)=10
+        values = [100] * 10
+        result = kk_allocate(values, capacity=120, min_groups=1, n_groups_divisor=8)
+        # k was capped from 16 → 10 (= len(values))
+        assert len(result) == 10
+        all_idx = sorted(sum(result, []))
+        assert all_idx == list(range(10))
 
-    # Also verify min_groups > len(values) still raises
-    with pytest.raises(RuntimeError):
-        kk_allocate([100, 200, 300], capacity=int(1e12), min_groups=5)
+        # Also verify min_groups > len(values) still raises
+        with pytest.raises(RuntimeError):
+            kk_allocate([100, 200, 300], capacity=int(1e12), min_groups=5)
 
     def test_k_upper_bound_with_divisor(self):
         """n_groups_divisor roundup can push k above n — should be clamped."""
