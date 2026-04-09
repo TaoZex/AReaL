@@ -1,7 +1,7 @@
 experiment_name: gsm8k-grpo-megatron
 trial_name: trial0
 
-seed: 42
+seed: 1
 # 启用 TMS offload, 允许非活跃模型 (ref) 在不使用时 swap 到 CPU
 enable_offload: true
 total_train_epochs: 10
@@ -41,7 +41,7 @@ gconfig:
   temperature: 1.0
 
 actor:
-  backend: "megatron:d2p2t1"
+  backend: "megatron:d1p1t4"
   experiment_name: ${experiment_name}
   trial_name: ${trial_name}
   path: /workspace/models/OLMoE-1B-7B-0924-Instruct
@@ -127,15 +127,15 @@ sglang:
   skip_tokenizer_init: true
   dtype: ${actor.dtype}
   max_running_requests: 24
-  context_length: 4096
+  context_length: 32768
   mem_fraction_static: 0.70
-  disable_radix_cache: true
-  chunked_prefill_size: -1
-  cpu_offload_gb: 0
-  enable_dp_attention: false
-  enable_ep_moe: false
-  dp_size: 1
-  ep_size: 1
+  # disable_radix_cache: true
+  # chunked_prefill_size: -1
+  # cpu_offload_gb: 0
+  # enable_dp_attention: false
+  # enable_ep_moe: false
+  # dp_size: 1
+  # ep_size: 1
 
 # ============================================================
 # vLLM 备选配置 (当前不使用)
