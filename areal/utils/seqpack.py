@@ -464,10 +464,6 @@ def kk_allocate(
     matching the approach used by veRL's ``rearrange_micro_batches`` which computes
     ``num_micro_batches = ceildiv(total_seqlen, max_token_len)`` before calling KK.
 
-    After KK partitioning, FFD is also executed (for metrics only) and a
-    structured comparison log is emitted so that the balance improvement can
-    be observed during training.
-
     Args:
         values: Sequence lengths (or token counts) to pack.
         capacity: Maximum sum of values per group.  When set to a very large
@@ -524,13 +520,9 @@ def kk_allocate(
             f"to be divisible by k ({k})"
         )
 
-    # --- Time KK ---
-    t0_kk = time.monotonic()
     partitions = _kk_partition(values, k, equal_size=equal_size)
-    t_kk = time.monotonic() - t0_kk
 
-    # Safety net: if any group still exceeds capacity (e.g., due to a single
-    # very large item close to capacity), fall back to FFD.
+    # Safety net: if any group still exceeds capacity, fall back to FFD.
     for group in partitions:
         group_sum = sum(values[i] for i in group)
         if group_sum > capacity:
@@ -541,86 +533,6 @@ def kk_allocate(
                 capacity,
             )
             return ffd_allocate(values, capacity, min_groups, n_groups_divisor)
-
-    # --- KK succeeded: run FFD for comparison metrics only ---
-    try:
-        t0_ffd = time.monotonic()
-        ffd_partitions = ffd_allocate(values, capacity, min_groups, n_groups_divisor)
-        t_ffd = time.monotonic() - t0_ffd
-    except Exception as e:
-        logger.debug("[PackingMetrics] FFD comparison run failed: %s", e)
-        ffd_partitions = None
-        t_ffd = 0.0
-
-    kk_metrics = _compute_packing_metrics(values, partitions, capacity)
-
-    if ffd_partitions is not None:
-        ffd_metrics = _compute_packing_metrics(values, ffd_partitions, capacity)
-
-        def _pct(kk_val: float, ffd_val: float) -> float:
-            """Compute percentage change (negative = KK is better / lower)."""
-            if ffd_val == 0:
-                return 0.0
-            return ((kk_val - ffd_val) / abs(ffd_val)) * 100.0
-
-        spread_adv = _pct(kk_metrics["spread"], ffd_metrics["spread"])
-        std_adv = _pct(kk_metrics["std_dev"], ffd_metrics["std_dev"])
-        max_load_adv = _pct(kk_metrics["max_load"], ffd_metrics["max_load"])
-        cv_adv = _pct(kk_metrics["cv"], ffd_metrics["cv"])
-
-        logger.info(
-            "[PackingMetrics] n_items=%d capacity=%d "
-            "| KK: groups=%d spread=%d std=%.1f max_load=%d cv=%.4f "
-            "imbal=%.4f util=%.3f wasted=%d time=%.4fs "
-            "| FFD: groups=%d spread=%d std=%.1f max_load=%d cv=%.4f "
-            "imbal=%.4f util=%.3f wasted=%d time=%.4fs "
-            "| KK_advantage: spread=%.1f%% std=%.1f%% max_load=%.1f%% cv=%.1f%%",
-            len(values),
-            capacity,
-            # KK metrics
-            kk_metrics["n_groups"],
-            kk_metrics["spread"],
-            kk_metrics["std_dev"],
-            kk_metrics["max_load"],
-            kk_metrics["cv"],
-            kk_metrics["imbalance_ratio"],
-            kk_metrics["utilization"],
-            kk_metrics["wasted_tokens"],
-            t_kk,
-            # FFD metrics
-            ffd_metrics["n_groups"],
-            ffd_metrics["spread"],
-            ffd_metrics["std_dev"],
-            ffd_metrics["max_load"],
-            ffd_metrics["cv"],
-            ffd_metrics["imbalance_ratio"],
-            ffd_metrics["utilization"],
-            ffd_metrics["wasted_tokens"],
-            t_ffd,
-            # Advantage
-            spread_adv,
-            std_adv,
-            max_load_adv,
-            cv_adv,
-        )
-    else:
-        logger.info(
-            "[PackingMetrics] n_items=%d capacity=%d "
-            "| KK: groups=%d spread=%d std=%.1f max_load=%d cv=%.4f "
-            "imbal=%.4f util=%.3f wasted=%d time=%.4fs "
-            "| FFD: unavailable",
-            len(values),
-            capacity,
-            kk_metrics["n_groups"],
-            kk_metrics["spread"],
-            kk_metrics["std_dev"],
-            kk_metrics["max_load"],
-            kk_metrics["cv"],
-            kk_metrics["imbalance_ratio"],
-            kk_metrics["utilization"],
-            kk_metrics["wasted_tokens"],
-            t_kk,
-        )
 
     return partitions
 
