@@ -1,8 +1,9 @@
 experiment_name: gsm8k-grpo-megatron
 trial_name: trial0
 
-seed: 1
-enable_offload: false
+seed: 42
+# 启用 TMS offload, 允许非活跃模型 (ref) 在不使用时 swap 到 CPU
+enable_offload: true
 total_train_epochs: 10
 tokenizer_path: ${actor.path}
 
@@ -22,7 +23,7 @@ rollout:
   backend: "sglang:d1p1t2"
   experiment_name: ${experiment_name}
   trial_name: ${trial_name}
-  max_concurrent_rollouts: 256
+  max_concurrent_rollouts: 48
   queue_size: null
   consumer_batch_size: ${train_dataset.batch_size}
   max_head_offpolicyness: 2
@@ -40,16 +41,16 @@ gconfig:
   temperature: 1.0
 
 actor:
-  backend: "megatron:(attn:d1p1t4|ffn:d1p1t1e4)"
+  backend: "megatron:d2p2t1"
   experiment_name: ${experiment_name}
   trial_name: ${trial_name}
   path: /workspace/models/OLMoE-1B-7B-0924-Instruct
   init_from_scratch: false
   disable_dropout: true
-  gradient_checkpointing: false
+  gradient_checkpointing: true
   dtype: bfloat16
   mb_spec:
-    max_tokens_per_mb: 10240
+    max_tokens_per_mb: 2048
   optimizer:
     type: adam_bf16
     lr: 3e-6
@@ -76,6 +77,8 @@ actor:
   adv_norm:
     mean_level: batch
     std_level: batch
+  # disk 模式: 避免 XCCL 转换兼容性问题, 同时节省显存
+  weight_update_mode: disk
   max_new_tokens: ${gconfig.max_new_tokens}
   scheduling_spec:
     - task_type: worker
@@ -84,7 +87,21 @@ actor:
       mem: 32
       cmd: python3 -m areal.infra.rpc.rpc_server
       env_vars: {}
+  megatron:
+    bridge_type: megatron-bridge
+    use_deterministic_algorithms: false
+    recompute_granularity: "full"
+    recompute_method: "uniform"
+    recompute_num_layers: 1
+    moe_router_dtype: "fp32"
+    moe_token_dispatcher_type: "alltoall"
+    moe_shared_expert_overlap: false
+    virtual_pipeline_parallel_size: 1
 
+# ============================================================
+# Ref 模型: 与 Actor 共享 GPU (colocation)
+# enable_offload=true 时, ref 在不使用时会被 swap 到 CPU
+# ============================================================
 ref:
   backend: ${actor.backend}
   experiment_name: ${experiment_name}
@@ -94,49 +111,66 @@ ref:
   disable_dropout: true
   dtype: ${actor.dtype}
   mb_spec:
-    max_tokens_per_mb: 10240
+    max_tokens_per_mb: 2048
   optimizer: null
   scheduling_strategy:
     type: colocation
     target: actor
   scheduling_spec: ${actor.scheduling_spec}
 
-# SGLang
+# ============================================================
+# SGLang 推理引擎配置
+# ============================================================
 sglang:
   model_path: ${actor.path}
   random_seed: ${seed}
   skip_tokenizer_init: true
   dtype: ${actor.dtype}
-  max_running_requests: null
-  context_length: 32768
-  mem_fraction_static: 0.8
+  max_running_requests: 24
+  context_length: 4096
+  mem_fraction_static: 0.70
+  disable_radix_cache: true
+  chunked_prefill_size: -1
+  cpu_offload_gb: 0
+  enable_dp_attention: false
+  enable_ep_moe: false
+  dp_size: 1
+  ep_size: 1
 
+# ============================================================
+# vLLM 备选配置 (当前不使用)
+# ============================================================
 vllm:
   model: ${actor.path}
   seed: ${seed}
   skip_tokenizer_init: false
   dtype: ${actor.dtype}
-  max_model_len: 32768
-  gpu_memory_utilization: 0.9
+  max_model_len: 4096
+  gpu_memory_utilization: 0.7
+  enforce_eager: true
 
-# datasets
+# ============================================================
+# 数据集: GSM8K
+# ============================================================
 train_dataset:
-  batch_size: 256
+  batch_size: 128
   shuffle: true
   pin_memory: true
   num_workers: 4
   path: openai/gsm8k
   type: rl
-  max_length: 1024
+  max_length: 512
 
 valid_dataset:
-  batch_size: 256
+  batch_size: 128
   pin_memory: true
   num_workers: 4
   path: openai/gsm8k
   type: rl
 
-# Utilities
+# ============================================================
+# 工具: Checkpoint / 恢复 / 评估 / 日志
+# ============================================================
 saver:
   experiment_name: ${experiment_name}
   trial_name: ${trial_name}
