@@ -17,24 +17,22 @@ no inline copies of the algorithm.
 Run with: pytest tests/test_kk_allocate.py -v
 """
 
-import math
 import random
 
 import pytest
 
 from areal.utils.seqpack import (
-    _KKSet,
-    _KKState,
-    _compute_packing_metrics,
-    _kk_partition,
-    ffd_allocate,
-    get_allocate_fn,
-    kk_allocate,
     PACKING_ALGORITHM_FFD,
     PACKING_ALGORITHM_KK,
     PACKING_ALGORITHMS,
+    _compute_packing_metrics,
+    _kk_partition,
+    _KKSet,
+    _KKState,
+    ffd_allocate,
+    get_allocate_fn,
+    kk_allocate,
 )
-
 
 # ---------------------------------------------------------------------------
 # Data generators (matching test_seqpack.py patterns)
@@ -332,9 +330,7 @@ class TestKKAllocate:
         """Test equal_size=True produces groups with identical element counts."""
         values = [100, 200, 300, 400, 500, 600]
         k = 3
-        result = kk_allocate(
-            values, capacity=int(1e12), min_groups=k, equal_size=True
-        )
+        result = kk_allocate(values, capacity=int(1e12), min_groups=k, equal_size=True)
         assert len(result) == k
         for group in result:
             assert len(group) == len(values) // k

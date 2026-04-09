@@ -16,12 +16,10 @@ import os
 import pickle
 import random
 
-import torch
 import torch.distributed as dist
 
 # Import real implementations — no inline copies
-from areal.utils.seqpack import kk_allocate, ffd_allocate
-
+from areal.utils.seqpack import ffd_allocate, kk_allocate
 
 # =====================================================================
 # Simulated redistribute_trajectories (mirrors dist_rollout.py logic)
@@ -88,14 +86,10 @@ def main():
     seqlens = generate_bimodal_seqlens(args.n_seqs, seed=args.seed)
 
     # Run FFD redistribution
-    ffd_indices, ffd_loads = redistribute_trajectories_sim(
-        seqlens, world_size, "ffd"
-    )
+    ffd_indices, ffd_loads = redistribute_trajectories_sim(seqlens, world_size, "ffd")
 
     # Run KK redistribution
-    kk_indices, kk_loads = redistribute_trajectories_sim(
-        seqlens, world_size, "kk"
-    )
+    kk_indices, kk_loads = redistribute_trajectories_sim(seqlens, world_size, "kk")
 
     # Compute metrics
     ffd_spread = max(ffd_loads) - min(ffd_loads)
@@ -116,9 +110,7 @@ def main():
         "kk_max_load": kk_max,
         "kk_wins": kk_spread < ffd_spread,
         "improvement_pct": (
-            (ffd_spread - kk_spread) / ffd_spread * 100
-            if ffd_spread > 0
-            else 0.0
+            (ffd_spread - kk_spread) / ffd_spread * 100 if ffd_spread > 0 else 0.0
         ),
     }
 

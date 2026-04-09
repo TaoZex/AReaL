@@ -25,7 +25,7 @@ from areal.utils.constants import (
     PROX_LOGP_METHODS_ALL,
 )
 from areal.utils.pkg_version import is_version_less
-from areal.utils.seqpack import PACKING_ALGORITHM_FFD, PACKING_ALGORITHMS
+from areal.utils.seqpack import PACKING_ALGORITHMS
 
 if TYPE_CHECKING:
     from transformers import PreTrainedTokenizerFast

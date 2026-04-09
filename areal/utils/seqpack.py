@@ -421,7 +421,7 @@ def _compute_packing_metrics(
     spread = max_load - min_load
     imbalance_ratio = spread / mean_load if mean_load > 0 else 0.0
     variance = sum((s - mean_load) ** 2 for s in group_sums) / n_groups
-    std_dev = variance ** 0.5
+    std_dev = variance**0.5
     cv = std_dev / mean_load if mean_load > 0 else 0.0
     max_load_ratio = max_load / mean_load if mean_load > 0 else 0.0
     utilization = mean_load / capacity if capacity > 0 else 0.0
@@ -548,9 +548,7 @@ def kk_allocate(
         ffd_partitions = ffd_allocate(values, capacity, min_groups, n_groups_divisor)
         t_ffd = time.monotonic() - t0_ffd
     except Exception as e:
-        logger.debug(
-            "[PackingMetrics] FFD comparison run failed: %s", e
-        )
+        logger.debug("[PackingMetrics] FFD comparison run failed: %s", e)
         ffd_partitions = None
         t_ffd = 0.0
 

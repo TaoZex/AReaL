@@ -17,8 +17,8 @@ from torchdata.stateful_dataloader import StatefulDataLoader
 from areal.api.cli_args import MicroBatchSpec, NormConfig
 from areal.infra.platforms import current_platform
 from areal.utils import logging, seqpack
-from areal.utils.seqpack import get_allocate_fn
 from areal.utils.math import align
+from areal.utils.seqpack import get_allocate_fn
 
 logger = logging.getLogger("DataUtils")
 
@@ -460,9 +460,7 @@ def allocate_balanced_mbs(mb_spec: MicroBatchSpec, lens: list[int]) -> list[list
         List of lists of indices, one per micro-batch.
     """
     assert mb_spec.max_tokens_per_mb is not None
-    allocate_fn = get_allocate_fn(
-        getattr(mb_spec, "packing_algorithm", "ffd")
-    )
+    allocate_fn = get_allocate_fn(getattr(mb_spec, "packing_algorithm", "ffd"))
     group_indices = allocate_fn(
         lens,
         mb_spec.max_tokens_per_mb,

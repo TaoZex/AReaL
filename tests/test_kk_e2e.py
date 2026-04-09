@@ -16,6 +16,7 @@ import os
 import pickle
 import subprocess
 import sys
+
 import pytest
 
 # Path to the torchrun worker script
@@ -68,7 +69,10 @@ def test_kk_vs_ffd_e2e(tmp_path, world_size, n_seqs, seed):
         capture_output=True,
         text=True,
         timeout=120,
-        env={**os.environ, "CUDA_VISIBLE_DEVICES": ",".join(str(i) for i in range(world_size))},
+        env={
+            **os.environ,
+            "CUDA_VISIBLE_DEVICES": ",".join(str(i) for i in range(world_size)),
+        },
     )
 
     assert result.returncode == 0, (
@@ -92,14 +96,14 @@ def test_kk_vs_ffd_e2e(tmp_path, world_size, n_seqs, seed):
     kk_spread = metrics["kk_spread"]
     ffd_spread = metrics["ffd_spread"]
 
-    print(f"\n{'='*60}")
+    print(f"\n{'=' * 60}")
     print(f"E2E Results (n_seqs={n_seqs}, world_size={world_size}, seed={seed}):")
     print(f"  FFD spread: {ffd_spread:>8,} tokens")
     print(f"  KK  spread: {kk_spread:>8,} tokens")
     print(f"  Improvement: {metrics['improvement_pct']:.1f}%")
     print(f"  FFD loads: {metrics['ffd_loads']}")
     print(f"  KK  loads: {metrics['kk_loads']}")
-    print(f"{'='*60}")
+    print(f"{'=' * 60}")
 
     # KK should be at least as good as FFD
     assert kk_spread <= ffd_spread * 1.05 + 50, (

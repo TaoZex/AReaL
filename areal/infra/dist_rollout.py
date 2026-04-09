@@ -13,7 +13,7 @@ from areal.utils.data import (
     split_and_unpad_tensor,
     tensor_container_to,
 )
-from areal.utils.seqpack import ffd_allocate, get_allocate_fn
+from areal.utils.seqpack import get_allocate_fn
 
 
 @dataclass
