@@ -1009,6 +1009,14 @@ class MegatronEngine(TrainEngine):
             torch, self.mcore_config.exp_avg_sq_dtype
         )
         # for run moe
+        mcore_opt_config.use_precision_aware_optimizer_no_fp8_or_ds_fp8 = (
+            mcore_opt_config.use_precision_aware_optimizer
+            and (
+                mcore_opt_config.main_params_dtype != torch.float32
+                or (mcore_opt_config.fp8_recipe is None or mcore_opt_config.fp8_recipe == "delayed")
+                or mcore_opt_config.optimizer_cpu_offload
+            )
+        )
         mcore_opt_config.store_param_remainders = True
         import logging as _logging
         _opt_logger = _logging.getLogger('AReaL.OptDiag')
