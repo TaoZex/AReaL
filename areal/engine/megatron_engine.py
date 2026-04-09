@@ -1397,7 +1397,7 @@ class MegatronEngine(TrainEngine):
         if dist.get_rank() == 0:
             fut = self.rollout_engine.update_weights_from_disk(meta)
 
-        self._save_model_to_hf(meta.path, self.tokenizer, None)
+        self._save_model_to_hf(meta.path, self.tokenizer, None, base_model_path=self.config.path)
         # dist.barrier() are called when _save_model_to_hf finished
 
         if dist.get_rank() == 0:
