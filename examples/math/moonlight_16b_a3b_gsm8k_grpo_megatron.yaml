@@ -50,7 +50,7 @@ actor:
   mb_spec:
     max_tokens_per_mb: 1280                             # ← 从 2048 降至 512
   optimizer:
-    type: sgd
+    type: adam_bf16
     lr: 5e-6
     weight_decay: 0.003
     beta1: 0.9
