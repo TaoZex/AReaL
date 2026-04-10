@@ -81,7 +81,7 @@ actor:
     use_deterministic_algorithms: false
     recompute_granularity: full
     recompute_method: uniform
-    recompute_num_layers: 1
+    recompute_num_layers: 27
     main_grads_dtype: bfloat16       # 梯度从 FP32 降为 BF16（节省 ~4 GiB）
     # store_param_remainders: true 
     # optimizer_cpu_offload: true
