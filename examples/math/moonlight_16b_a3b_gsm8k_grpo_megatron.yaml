@@ -48,7 +48,7 @@ actor:
   gradient_checkpointing: true
   dtype: bfloat16
   mb_spec:
-    max_tokens_per_mb: 1280                             # ← 从 2048 降至 512
+    max_tokens_per_mb: 640                             # ← 从 2048 降至 512
   optimizer:
     type: adam_bf16
     lr: 5e-6
@@ -64,7 +64,7 @@ actor:
   reward_scaling: 10.0
   reward_bias: -0.5
   kl_ctl: 0.0
-  ppo_n_minibatches: 4                                # ← 从 1 提高至 4（分批梯度累积）
+  ppo_n_minibatches: 8                                # ← 从 1 提高至 4（分批梯度累积）
   recompute_logprob: true
   use_decoupled_loss: true
   behave_imp_weight_cap: 5.0
@@ -137,7 +137,7 @@ vllm:
   gpu_memory_utilization: 0.75
 
 train_dataset:
-  batch_size: 128
+  batch_size: 64
   shuffle: true
   pin_memory: true
   num_workers: 4
