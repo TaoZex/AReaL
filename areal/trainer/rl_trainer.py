@@ -431,6 +431,17 @@ class PPOTrainer:
                     args={"global_step": global_step},
                 ),
             ):
+                # R3: Normalize routed_experts keys across all trajectory
+                # dicts before concatenation.  Some trajectories may lack the
+                # key (inference abort / extract failure), which would crash
+                # concat_padded_tensors.  This fills missing entries with
+                # zero-padded tensors so all dicts share the same key set.
+                if any("routed_experts" in t for t in rollout_batch):
+                    from areal.trainer.ppo.actor_r3_patch import (
+                        normalize_routed_experts_keys,
+                    )
+                    normalize_routed_experts_keys(rollout_batch)
+
                 adv_batch = self.actor.compute_advantages(rollout_batch)
                 self.actor.get_device_stats().log("compute advantages")
 
@@ -445,16 +456,31 @@ class PPOTrainer:
                     args={"global_step": global_step},
                 ),
             ):
+                # R3: Normalize routed_experts keys and localize any
+                # RTensor values BEFORE logging or ppo_update.  After
+                # compute_advantages + split_batch + redistribution,
+                # dicts may contain RTensor wrappers or inconsistent keys.
+                if any("routed_experts" in t for t in adv_batch):
+                    from areal.trainer.ppo.actor_r3_patch import (
+                        normalize_routed_experts_keys,
+                    )
+                    normalize_routed_experts_keys(adv_batch)
+
                 # MoE routing metrics: Log for ALL MoE models when
                 # routed_experts data is available in the trajectory.
                 # R3 data stats are logged only when R3 is enabled.
+                # R3-vs-baseline comparison metrics are always logged when
+                # routed_experts is present so that both R3 and non-R3 runs
+                # produce comparable WandB curves.
                 for traj in adv_batch:
                     if "routed_experts" in traj:
                         from areal.trainer.ppo.actor_r3_patch import (
                             log_moe_routing_metrics,
                             log_r3_data_stats,
+                            log_r3_vs_baseline_metrics,
                         )
                         log_moe_routing_metrics(traj)
+                        log_r3_vs_baseline_metrics(traj)
                         if getattr(self.config.rollout, "return_routed_experts", False):
                             log_r3_data_stats(traj)
                         break  # Log once per batch, not per trajectory

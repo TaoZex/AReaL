@@ -71,6 +71,29 @@ def extract_routed_experts(
     if routed_experts_np is None:
         return None
 
+    # Defensive: ensure we have a numpy array
+    if not isinstance(routed_experts_np, np.ndarray):
+        logger.warning(
+            "[R3] extract_routed_experts received %s instead of np.ndarray; "
+            "attempting conversion.",
+            type(routed_experts_np).__name__,
+        )
+        try:
+            routed_experts_np = np.asarray(routed_experts_np, dtype=np.int32)
+        except Exception:
+            logger.warning(
+                "[R3] Failed to convert routed_experts to np.ndarray; skipping.",
+                exc_info=True,
+            )
+            return None
+
+    if routed_experts_np.ndim == 1:
+        logger.warning(
+            "[R3] routed_experts is 1D (shape=%s); cannot reshape. Skipping.",
+            routed_experts_np.shape,
+        )
+        return None
+
     try:
         if num_moe_layers is not None and topk is not None:
             from areal.engine.router_replay_utils import (
@@ -156,7 +179,38 @@ def inject_routed_experts_into_result(
 
     This is a trivial helper kept separate for clarity and to centralise
     the key name (``"routed_experts"``).
+
+    Includes defensive type validation: if *routed_experts* is not a
+    ``torch.Tensor`` it is converted or discarded so that downstream
+    code never encounters an unexpected type under this key.
     """
-    if routed_experts is not None:
-        result["routed_experts"] = routed_experts
+    if routed_experts is None:
+        return result
+
+    if not isinstance(routed_experts, torch.Tensor):
+        logger.warning(
+            "[R3] inject_routed_experts_into_result: received %s (type=%s) "
+            "instead of torch.Tensor; attempting conversion.",
+            type(routed_experts).__name__,
+            getattr(routed_experts, "shape", "N/A"),
+        )
+        try:
+            if isinstance(routed_experts, np.ndarray):
+                routed_experts = torch.from_numpy(routed_experts.astype(np.int32))
+            else:
+                routed_experts = torch.tensor(routed_experts, dtype=torch.int32)
+        except Exception:
+            logger.warning(
+                "[R3] inject_routed_experts_into_result: conversion failed; "
+                "discarding routed_experts.",
+                exc_info=True,
+            )
+            return result
+
+    logger.debug(
+        "[R3] Injecting routed_experts into result: shape=%s, dtype=%s.",
+        routed_experts.shape,
+        routed_experts.dtype,
+    )
+    result["routed_experts"] = routed_experts
     return result

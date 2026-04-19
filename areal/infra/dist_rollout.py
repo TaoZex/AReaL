@@ -117,6 +117,17 @@ class DistRolloutCoordinator:
             Redistributed and broadcast batch available on all ranks (list of trajs)
         """
         if trajectories is not None:
+            # R3: Normalize routed_experts keys before redistribution.
+            # Within one rank's trajectory list, some dicts may have
+            # 'routed_experts' and others may not.  all_gather_tensor_container
+            # requires matching keys across ranks at the same list index,
+            # so we must ensure consistency within each rank first.
+            if any("routed_experts" in t for t in trajectories):
+                from areal.trainer.ppo.actor_r3_patch import (
+                    normalize_routed_experts_keys,
+                )
+                normalize_routed_experts_keys(trajectories)
+
             redist = redistribute_trajectories(
                 trajectories,
                 group=self.train_engine.data_parallel_group,

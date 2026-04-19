@@ -1132,6 +1132,14 @@ class TrainEngineConfig:
             "Currently only used by the TrainController."
         },
     )
+    # R3 (Route Replay) internal flag
+    _r3_enable_router_replay: bool = field(
+        default=False,
+        metadata={
+            "help": "Internal flag: enable Router Replay (R3) on this engine. "
+            "Set automatically by rl_trainer when R3 is configured."
+        },
+    )
 
     def __post_init__(self):
         """Validate scheduling_spec length and config combinations."""

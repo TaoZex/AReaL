@@ -463,11 +463,25 @@ def _r3_forward_backward_batch(
     #     The forward_step wrapper will toggle between REPLAY_FORWARD
     #     and REPLAY_BACKWARD for each micro-batch.
     # ------------------------------------------------------------------
+    # Reset agreement rate accumulator for this training step
+    RouterReplay.reset_agreement_stats()
+
+    n_router_instances = len(RouterReplay.router_instances)
     RouterReplay.set_global_router_replay_action(RouterReplayAction.REPLAY_FORWARD)
-    logger.debug(
-        "[R3] Set initial REPLAY_FORWARD action on %d router instances.",
-        len(RouterReplay.router_instances),
+    logger.info(
+        "[R3] Replay setup: %d RouterReplay instances, %d micro-batches, "
+        "action=REPLAY_FORWARD.  per_mb_experts shapes: %s.",
+        n_router_instances,
+        len(per_mb_routed_experts),
+        [x.shape if x is not None else None for x in per_mb_routed_experts],
     )
+    if n_router_instances == 0:
+        logger.warning(
+            "[R3] WARNING: No RouterReplay instances found!  This means "
+            "enable_routing_replay was not set on TransformerConfig when "
+            "TopKRouter was initialised, or apply_router_replay_patch() "
+            "was called after model creation.  R3 replay will be a no-op."
+        )
 
     # ------------------------------------------------------------------
     # 3. Wrap the MicroBatchList iterator on the INSTANCE level
@@ -616,9 +630,36 @@ def _r3_forward_backward_batch(
         # Remove forward hooks
         for handle in hook_handles:
             handle.remove()
+
+        # --- Log Router Agreement Rate before clearing state ---
+        try:
+            agreement_rate = RouterReplay.get_agreement_rate()
+            if agreement_rate >= 0:
+                from areal.utils import stats_tracker as _st
+                with _st.scope("r3"):
+                    _st.scalar(router_agreement_rate=agreement_rate)
+                logger.info(
+                    "[R3] Router agreement rate for this step: %.4f "
+                    "(%d/%d tokens matched).",
+                    agreement_rate,
+                    RouterReplay._agreement_matches,
+                    RouterReplay._agreement_total,
+                )
+            else:
+                logger.warning(
+                    "[R3] Router agreement rate is -1 (no tokens accumulated). "
+                    "This means REPLAY_FORWARD was never executed with valid "
+                    "target_topk_idx.  Check: (1) RouterReplay instances=%d, "
+                    "(2) setup_per_microbatch_replay_forward was called, "
+                    "(3) target_topk_idx was set on router instances.",
+                    len(RouterReplay.router_instances),
+                )
+        except Exception:
+            logger.warning("[R3] Failed to log agreement rate.", exc_info=True)
+
         # Restore original class __iter__ and clean up R3 state
         mb_list.__class__.__iter__ = original_class_iter
         clear_router_replay()
         self._r3_per_mb_experts = None
         self._r3_mb_counter = 0
-        logger.debug("[R3] forward_backward_batch cleanup complete.")
+        logger.info("[R3] forward_backward_batch cleanup complete.")

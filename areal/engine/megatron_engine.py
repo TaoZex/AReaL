@@ -287,6 +287,13 @@ class MegatronEngine(TrainEngine):
 
         # R3: Check early so the variable is always defined.
         _r3_enabled = getattr(self.config, "_r3_enable_router_replay", False)
+        self.logger.info(
+            "[R3] initialize() config check: _r3_enable_router_replay=%s, "
+            "config_type=%s, rank=%s",
+            _r3_enabled,
+            type(self.config).__name__,
+            os.environ.get("RANK", "?"),
+        )
         with patch_bridge_for_tree_training(
             self.enable_tree_training and self.bridge_cls == "mbridge"
         ):
@@ -413,7 +420,24 @@ class MegatronEngine(TrainEngine):
         if _r3_enabled:
             from areal.engine.megatron_engine_r3_patch import patch_megatron_engine_for_r3
             patch_megatron_engine_for_r3(self, enable_router_replay=True)
-            self.logger.info("[R3] Router Replay enabled on MegatronEngine.")
+            from areal.engine.router_replay_patch import RouterReplay
+            n_instances = len(RouterReplay.router_instances)
+            self.logger.info(
+                "[R3] Router Replay enabled on MegatronEngine. "
+                "RouterReplay instances: %d. "
+                "tf_config.enable_routing_replay=%s.",
+                n_instances,
+                getattr(self.tf_config, "enable_routing_replay", "N/A"),
+            )
+            if n_instances == 0:
+                self.logger.warning(
+                    "[R3] WARNING: Zero RouterReplay instances after model creation! "
+                    "The R3 patch was applied but no TopKRouter was wrapped. "
+                    "Check that (1) the model is an MoE model, "
+                    "(2) apply_router_replay_patch() was called BEFORE make_mcore_model()."
+                )
+        else:
+            self.logger.info("[R3] Router Replay NOT enabled (_r3_enable_router_replay=False).")
         self._initialized = True
 
     def _build_hf_mcore_bridge(self):

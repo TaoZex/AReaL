@@ -148,6 +148,7 @@ class RouterReplay:
         """Clear recorded and target indices on all instances."""
         for r in RouterReplay.router_instances:
             r.clear_indices()
+        RouterReplay.reset_agreement_stats()
 
     @staticmethod
     def set_global_router_replay_action(action: RouterReplayAction) -> None:
@@ -163,6 +164,25 @@ class RouterReplay:
 
 
 
+
+    # Class-level accumulator for router agreement rate across micro-batches.
+    # Populated during REPLAY_FORWARD, consumed by the engine patch after
+    # forward_backward_batch completes.
+    _agreement_matches: int = 0
+    _agreement_total: int = 0
+
+    @classmethod
+    def reset_agreement_stats(cls) -> None:
+        """Reset the agreement rate accumulator before a training step."""
+        cls._agreement_matches = 0
+        cls._agreement_total = 0
+
+    @classmethod
+    def get_agreement_rate(cls) -> float:
+        """Return the accumulated agreement rate.  -1.0 if no data."""
+        if cls._agreement_total == 0:
+            return -1.0
+        return cls._agreement_matches / cls._agreement_total
 
     def __init__(self) -> None:
         self.target_topk_idx: torch.Tensor | None = None
@@ -247,14 +267,38 @@ def _patched_topk_routing_with_score_function(
             if router_replay is None or router_replay.target_topk_idx is None:
                 # Fallback if replay data is not available
                 logger.warning(
-                    "[R3] REPLAY_FORWARD: no replay indices available, "
-                    "falling back to normal routing."
+                    "[R3] REPLAY_FORWARD: no replay indices available "
+                    "(router_replay=%s, target_topk_idx=%s); falling back "
+                    "to natural routing.  This layer will NOT contribute to "
+                    "the agreement rate.",
+                    "present" if router_replay is not None else "None",
+                    type(router_replay.target_topk_idx).__name__
+                    if router_replay is not None and router_replay.target_topk_idx is not None
+                    else "None",
                 )
                 return _compute_topk(scores, topk, num_groups=num_groups, group_topk=group_topk)
             # Use the provided indices for replay
             top_indices = router_replay.target_topk_idx
             top_indices = top_indices.to(scores.device)
             probs = scores.gather(1, top_indices)
+
+            # --- Router Agreement Rate: compare replay vs natural routing ---
+            # Compute what the router would have chosen WITHOUT replay
+            # (no grad to avoid interfering with the backward graph).
+            try:
+                with torch.no_grad():
+                    _, natural_indices = _compute_topk(
+                        scores, topk, num_groups=num_groups, group_topk=group_topk
+                    )
+                    # Compare: sort both along topk dim for order-invariant match
+                    replay_sorted = top_indices.sort(dim=-1).values
+                    natural_sorted = natural_indices.sort(dim=-1).values
+                    matches = (replay_sorted == natural_sorted).all(dim=-1)
+                    RouterReplay._agreement_matches += int(matches.sum().item())
+                    RouterReplay._agreement_total += int(matches.numel())
+            except Exception:
+                logger.debug("[R3] Agreement rate computation failed.", exc_info=True)
+
             return probs, top_indices
 
         elif routing_action == RouterReplayAction.REPLAY_BACKWARD:
