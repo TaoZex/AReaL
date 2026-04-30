@@ -607,19 +607,50 @@ def grpo_loss_fn(
     )
 
     # ---- R3 Logprob Diff: rollout (inference) vs training logprobs ----
-    # compute |rollout_logprobs - training_logprobs|
-    # over response tokens only. This metric quantifies train/infer mismatch
-    # caused by MoE routing divergence. With R3 enabled, this diff should be
-    # smaller than without R3.
+    # Three metrics quantify train/infer divergence at different granularities:
+    #
+    # 1. ``rollout_train_logprobs_abs_diff`` (old_logp vs current-train logprobs)
+    #    Conflates (a) train/infer gap AND (b) intra-ppo_update weight drift
+    #    from earlier mini-batches. At ``max_head_offpolicyness>0`` this metric
+    #    grows with mini-batch index because ``logprobs`` is forwarded on
+    #    W_current (already stepped i times within the epoch), while
+    #    ``old_logp`` stays fixed at W_rollout.  R3 cannot reduce this drift.
+    #
+    # 2. ``rollout_train_logprobs_abs_diff_prox`` (old_logp vs prox_logp_gt)
+    #    The *pure* train/infer mismatch: both evaluated on W_rollout, differing
+    #    only in SGLang-vs-Megatron forward (fused kernel + router top-k).
+    #    With R3 enabled and weights fully synced (k=0), this should collapse
+    #    to BF16 kernel noise. With R3 off, ~2% per-expert router flips add
+    #    ~0.1-0.2 abs-diff per token.  This is the metric to validate R3
+    #    effectiveness across staleness settings.
+    #
+    # Both are logged via ``stats_tracker.stat`` with ``n_valid_tokens``
+    # denominator so the aggregation is a proper token-weighted global
+    # mean/min/max (cross-mini-batch, cross-rank), not a Python-float mean
+    # of per-minibatch local scalars (which would be small-batch-biased and
+    # would report local stds as if they were global ones).
     if loss_mask.any():
         with torch.no_grad():
-            _logprob_diff = (old_logp[loss_mask] - logprobs.detach()[loss_mask]).abs()
-            _diff_mean = _logprob_diff.mean().item()
-            _diff_std = _logprob_diff.std().item() if _logprob_diff.numel() > 1 else 0.0
-        stats_tracker.scalar(
-            rollout_train_logprobs_abs_diff_mean=_diff_mean,
-            rollout_train_logprobs_abs_diff_std=_diff_std,
+            _diff_abs = (old_logp - logprobs.detach()).abs().float()
+            _diff_abs = torch.where(loss_mask, _diff_abs, torch.zeros_like(_diff_abs))
+            _diff_sq = (_diff_abs * _diff_abs).float()
+        stats_tracker.stat(
+            rollout_train_logprobs_abs_diff=_diff_abs,
+            rollout_train_logprobs_sq_diff=_diff_sq,
+            denominator="n_valid_tokens",
         )
+        if prox_logp_gt is not None:
+            with torch.no_grad():
+                _prox_abs = (old_logp - prox_logp_gt.detach()).abs().float()
+                _prox_abs = torch.where(
+                    loss_mask, _prox_abs, torch.zeros_like(_prox_abs)
+                )
+                _prox_sq = (_prox_abs * _prox_abs).float()
+            stats_tracker.stat(
+                rollout_train_logprobs_abs_diff_prox=_prox_abs,
+                rollout_train_logprobs_sq_diff_prox=_prox_sq,
+                denominator="n_valid_tokens",
+            )
 
     if "behave_imp_weight" in stat:
         stats_tracker.denominator(unclipped_behave_tokens=stat["behave_mask"])
