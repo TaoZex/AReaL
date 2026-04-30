@@ -142,17 +142,95 @@ class PPOActor:
         ):
             from areal.trainer.ppo.actor_r3_patch import _resolve_to_tensor
             _r3_routed_experts = _resolve_to_tensor(_r3_routed_experts)
-        if _r3_routed_experts is not None and getattr(
-            self.engine, "_r3_enabled", False
-        ):
+        _r3_enabled = bool(getattr(self.engine, "_r3_enabled", False))
+        if _r3_routed_experts is not None and _r3_enabled:
             # forward_batch performs ONE forward_backward_batch(forward_only=True)
             # call internally; the R3 engine patch will split routed_experts per
             # micro-batch and consume the side-channel (setting it back to None).
             self.engine._r3_pending_routed_experts = _r3_routed_experts
-        return self.engine.forward(
+        train_logp = self.engine.forward(
             input_=data,
             aggregate_fn=lambda xs: torch.cat(xs, dim=-1),
         )
+        # R3 effectiveness metrics. At compute_logp time the training weights
+        # equal the rollout weights (no optimizer step has touched θ in this
+        # rollout epoch), so comparing SGLang's cached logprobs against the
+        # Megatron forward result isolates the router-replay effect from any
+        # off-policy weight drift. If R3 works, these divergence metrics should
+        # drop relative to the R3-off baseline.
+        self._log_r3_effectiveness_stats(
+            data=data,
+            train_logp=train_logp,
+            r3_enabled=_r3_enabled,
+        )
+        return train_logp
+
+    @torch.no_grad()
+    def _log_r3_effectiveness_stats(
+        self,
+        data: dict[str, Any],
+        train_logp: torch.Tensor | None,
+        r3_enabled: bool,
+    ) -> None:
+        """Log rollout vs. training logprob divergence to gauge R3 quality.
+
+        All metrics are computed under ``ppo_actor/compute_logp/r3`` and are
+        designed so that lower values indicate a more faithful replay of the
+        rollout-time routing decisions:
+
+        * ``rollout_train_logp_abs_diff`` - mean ``|logp_train - logp_rollout|``
+        * ``rollout_train_logp_sq_diff`` - mean squared difference
+        * ``rollout_train_k3_kl`` - Schulman k3 estimator ``exp(Δ) - 1 - Δ``
+          (unbiased, non-negative estimator of ``KL(π_rollout || π_train)``)
+        * ``rollout_train_extreme_frac_tau2`` / ``_tau5`` - F(τ) extreme token
+          fraction from the Router Replay paper (Eq. 3), i.e. the share of
+          tokens whose importance ratio leaves ``[1/τ, τ]``
+        * ``r3_enabled`` scalar - 1 when the R3 side-channel was active
+        """
+        if train_logp is None:
+            return
+        rollout_logp = data.get("logprobs")
+        loss_mask = data.get("loss_mask")
+        if rollout_logp is None or loss_mask is None:
+            return
+        # engine.forward returns logprobs aligned to ``roll(input_ids, -1)`` -
+        # i.e. position t holds the logprob of token t+1. ``data["logprobs"]``
+        # from the inference engine follows the same pre-roll convention, so
+        # the two tensors are directly comparable. ``loss_mask`` in ``data``
+        # has not yet been shifted (that happens in ``_compute_advantages``),
+        # so roll it here to align the valid-token mask with the logprobs.
+        shifted_mask = torch.roll(loss_mask, shifts=-1, dims=-1).bool()
+        if shifted_mask.shape != train_logp.shape:
+            return
+        # Shape-align rollout logprobs (dtype may differ across backends).
+        rollout_logp_f = rollout_logp.to(train_logp.dtype)
+        if rollout_logp_f.shape != train_logp.shape:
+            return
+
+        log_ratio = (train_logp.float() - rollout_logp_f.float()).detach()
+        abs_diff = log_ratio.abs()
+        sq_diff = log_ratio * log_ratio
+        k3_kl = torch.expm1(log_ratio) - log_ratio  # exp(Δ) - 1 - Δ
+        # F(τ) from the Router Replay paper: fraction of tokens with
+        # max(r, 1/r) > τ, where r = exp(logp_train - logp_rollout).
+        abs_log_ratio = log_ratio.abs()
+        extreme_tau2 = (abs_log_ratio > torch.log(torch.tensor(2.0))).float()
+        extreme_tau5 = (abs_log_ratio > torch.log(torch.tensor(5.0))).float()
+
+        with stats_tracker.scope("compute_logp"):
+            with stats_tracker.scope("r3"):
+                stats_tracker.denominator(
+                    n_valid_tokens=shifted_mask,
+                )
+                stats_tracker.stat(
+                    rollout_train_logp_abs_diff=abs_diff,
+                    rollout_train_logp_sq_diff=sq_diff,
+                    rollout_train_k3_kl=k3_kl,
+                    rollout_train_extreme_frac_tau2=extreme_tau2,
+                    rollout_train_extreme_frac_tau5=extreme_tau5,
+                    denominator="n_valid_tokens",
+                )
+                stats_tracker.scalar(r3_enabled=float(r3_enabled))
 
     @trace_perf("ppo_actor.compute_advantages", category="compute")
     def compute_advantages(self, data: list[dict[str, Any]]) -> list[dict[str, Any]]:
