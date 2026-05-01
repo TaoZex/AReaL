@@ -14,7 +14,6 @@ routing indices into the layout expected by Megatron-Core's RouterReplay:
 from __future__ import annotations
 
 import inspect
-import logging
 import os
 from typing import Optional
 
@@ -22,7 +21,11 @@ import torch
 
 from areal.engine.router_replay_patch import RouterReplay, RouterReplayAction
 
-logger = logging.getLogger(__name__)
+from areal.utils import logging
+
+# NOTE: use areal.utils.logging.getLogger with a stable registered
+# name so the logger survives the dictConfig(disable_existing_loggers=True) re-init path.
+logger = logging.getLogger("R3/utils")
 
 
 # ===================================================================

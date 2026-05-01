@@ -25,14 +25,17 @@ Ref some code from megatron or verl, adapted for AReaL.
 
 from __future__ import annotations
 
-import logging
 import types
 from collections.abc import Callable
 from typing import Any
 
 import torch
 
-logger = logging.getLogger(__name__)
+from areal.utils import logging
+
+# NOTE: use areal.utils.logging.getLogger with a stable registered
+# name so the logger survives the dictConfig(disable_existing_loggers=True) re-init path.
+logger = logging.getLogger("R3/megatron")
 
 
 # ===================================================================

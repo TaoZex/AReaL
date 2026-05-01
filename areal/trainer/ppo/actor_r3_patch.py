@@ -7,12 +7,15 @@ them across mini-batches for side-channel delivery to the training engine.
 
 from __future__ import annotations
 
-import logging
 from typing import Any
 
 import torch
 
-logger = logging.getLogger(__name__)
+from areal.utils import logging
+
+# NOTE: use areal.utils.logging.getLogger with a stable registered
+# name so the logger survives the dictConfig(disable_existing_loggers=True) re-init path.
+logger = logging.getLogger("R3/actor")
 
 
 def _resolve_to_tensor(obj: Any) -> torch.Tensor | None:

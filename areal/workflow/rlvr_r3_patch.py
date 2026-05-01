@@ -17,12 +17,15 @@ The conversion pipeline:
 
 from __future__ import annotations
 
-import logging
 
 import numpy as np
 import torch
 
-logger = logging.getLogger(__name__)
+from areal.utils import logging
+
+# NOTE: use areal.utils.logging.getLogger with a stable registered
+# name so the logger survives the dictConfig(disable_existing_loggers=True) re-init path.
+logger = logging.getLogger("R3/rlvr")
 
 _RESOLVED_CACHE: dict[str, tuple[int, int]] = {}
 

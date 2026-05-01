@@ -12,7 +12,6 @@ Ref some code from megatron or verl, adapted for AReaL.
 from __future__ import annotations
 
 import inspect
-import logging
 import types
 import warnings
 from enum import Enum
@@ -20,7 +19,11 @@ from functools import wraps
 
 import torch
 
-logger = logging.getLogger(__name__)
+from areal.utils import logging
+
+# NOTE: use areal.utils.logging.getLogger with a stable registered
+# name so the logger survives the dictConfig(disable_existing_loggers=True) re-init path.
+logger = logging.getLogger("R3/patch")
 
 # ---------------------------------------------------------------------------
 # Optional megatron-core imports with fallback
