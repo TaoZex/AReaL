@@ -85,6 +85,7 @@ def _align_routed_experts_to_mask(
     routed_experts: torch.Tensor,
     cu_seqlens: torch.Tensor,
     max_seqlen: int,
+    _r3_mb_idx: int | None = None,
 ) -> torch.Tensor:
     """Align ``routed_experts`` from right-padded rollout format to left-aligned
     training format, matching the token layout implied by ``cu_seqlens``.
@@ -138,6 +139,63 @@ def _align_routed_experts_to_mask(
         "n_seqs=%d (re_bs=%d), seq_lens=%s.",
         routed_experts.shape, aligned.shape, n_seqs, re_bs, seq_lens[:8],
     )
+    # Detailed alignment log: smoking-gun check for the "last generated token
+    # has no routing" edge case (SGLang convention: num_sgl_tokens =
+    # prompt_len + gen_len - 1). If cu_seqlens claims k real tokens but the
+    # source only has k-1 non-zero rows, the k-th row here is a ZERO ROW that
+    # will route to expert 0 unconditionally.
+    try:
+        from areal.engine.router_replay_utils import (
+            _r3_pp_tp_info,
+            _r3_should_log,
+            _r3_tensor_sig,
+            _r3_verbose,
+        )
+
+        if _r3_verbose() and _r3_should_log("_align_routed_experts_to_mask"):
+            with torch.no_grad():
+                per_row_zero_src = (
+                    (routed_experts == 0).reshape(re_bs, re_seqlen, -1).all(dim=-1)
+                )
+                src_zero_rows_per_sample = per_row_zero_src.sum(dim=-1).tolist()
+                per_row_zero_dst = (
+                    (aligned == 0).reshape(n_seqs, max_seqlen, -1).all(dim=-1)
+                )
+                dst_zero_rows_per_sample = per_row_zero_dst.sum(dim=-1).tolist()
+                # For each sample, locate first zero-row idx within the real-token window.
+                first_zero_in_real = []
+                for i in range(min(n_seqs, re_bs)):
+                    L = int(seq_lens[i])
+                    if L <= 0:
+                        first_zero_in_real.append(-1)
+                        continue
+                    row = per_row_zero_src[i, :L]
+                    idx = torch.nonzero(row, as_tuple=False)
+                    first_zero_in_real.append(
+                        int(idx[0].item()) if idx.numel() > 0 else -1
+                    )
+            logger.info(
+                "[R3-STAGE3/_align_routed_experts_to_mask] mb=%s %s "
+                "re_shape=%s aligned_shape=%s n_seqs=%d re_bs=%d "
+                "seq_lens[:8]=%s src_zero_rows_per_sample[:8]=%s "
+                "first_zero_in_real_window[:8]=%s "
+                "dst_zero_rows_per_sample[:8]=%s | %s | %s",
+                _r3_mb_idx,
+                _r3_pp_tp_info(),
+                tuple(routed_experts.shape),
+                tuple(aligned.shape),
+                n_seqs,
+                re_bs,
+                seq_lens[:8],
+                src_zero_rows_per_sample[:8],
+                first_zero_in_real[:8],
+                dst_zero_rows_per_sample[:8],
+                _r3_tensor_sig("src_re", routed_experts, max_sample=4),
+                _r3_tensor_sig("aligned", aligned, max_sample=4),
+            )
+    except Exception:
+        # diagnostic helper must never break the main flow
+        pass
     return aligned
 
 
@@ -232,6 +290,29 @@ def _split_routed_experts_for_mbs(
         [r.shape[0] for r in result],
         "None" if forward_indices is None else f"len={len(forward_indices)}",
     )
+    try:
+        from areal.engine.router_replay_utils import (
+            _r3_pp_tp_info,
+            _r3_should_log,
+            _r3_tensor_sig,
+            _r3_verbose,
+        )
+
+        if _r3_verbose() and _r3_should_log("_split_routed_experts_for_mbs"):
+            logger.info(
+                "[R3-STAGE3/_split_routed_experts_for_mbs] %s "
+                "input_shape=%s n_mbs=%d forward_indices=%s "
+                "per_mb_shapes=%s | %s",
+                _r3_pp_tp_info(),
+                tuple(routed_experts.shape),
+                n_mbs,
+                "None" if forward_indices is None
+                else f"len={len(forward_indices)} first16={forward_indices[:16].tolist() if hasattr(forward_indices,'tolist') else list(forward_indices)[:16]}",
+                [tuple(r.shape) for r in result],
+                _r3_tensor_sig("routed_experts", routed_experts, max_sample=4),
+            )
+    except Exception:
+        pass
     return result
 
 
@@ -250,20 +331,44 @@ def _get_cu_seqlens_for_mb(mb_item) -> tuple[torch.Tensor, int] | None:
         ``(cu_seqlens, max_seqlen)`` or ``None`` if not available.
     """
     # Try padded_mb first (has TP-aligned cu_seqlens -- this is what the model sees)
+    source = None
     if hasattr(mb_item, "padded_mb") and isinstance(mb_item.padded_mb, dict):
         cu = mb_item.padded_mb.get("cu_seqlens")
         max_sl = mb_item.padded_mb.get("max_seqlen")
         if cu is not None and max_sl is not None:
-            return cu, int(max_sl)
+            source = ("padded_mb", cu, int(max_sl))
 
     # Try orig_mb as fallback (pre-padding cu_seqlens)
-    if hasattr(mb_item, "orig_mb") and isinstance(mb_item.orig_mb, dict):
+    if source is None and hasattr(mb_item, "orig_mb") and isinstance(mb_item.orig_mb, dict):
         cu = mb_item.orig_mb.get("cu_seqlens")
         max_sl = mb_item.orig_mb.get("max_seqlen")
         if cu is not None and max_sl is not None:
-            return cu, int(max_sl)
+            source = ("orig_mb", cu, int(max_sl))
 
-    return None
+    if source is None:
+        return None
+
+    src_name, cu_out, max_sl_out = source
+    try:
+        from areal.engine.router_replay_utils import (
+            _r3_pp_tp_info,
+            _r3_should_log,
+            _r3_tensor_sig,
+            _r3_verbose,
+        )
+
+        if _r3_verbose() and _r3_should_log("_get_cu_seqlens_for_mb"):
+            logger.info(
+                "[R3-STAGE3/_get_cu_seqlens_for_mb] %s source=%s "
+                "max_seqlen=%d | %s",
+                _r3_pp_tp_info(),
+                src_name,
+                max_sl_out,
+                _r3_tensor_sig("cu_seqlens", cu_out),
+            )
+    except Exception:
+        pass
+    return cu_out, max_sl_out
 
 
 # ===================================================================
@@ -288,6 +393,10 @@ def _r3_forward_backward_batch(
     from areal.engine.router_replay_patch import RouterReplay, RouterReplayAction
     from areal.engine.router_replay_utils import (
         RouterReplayHelper,
+        _r3_pp_tp_info,
+        _r3_should_log,
+        _r3_tensor_sig,
+        _r3_verbose,
         clear_router_replay,
         setup_per_microbatch_replay_forward,
     )
@@ -352,6 +461,18 @@ def _r3_forward_backward_batch(
         routed_experts_batch.shape,
         forward_only,
     )
+    if _r3_verbose() and _r3_should_log("_r3_forward_backward_batch/ENTER"):
+        logger.info(
+            "[R3-STAGE3/_r3_forward_backward_batch] ENTER %s "
+            "n_mbs=%d forward_only=%s from_side_channel=%s "
+            "has_padded_mbs=%s | %s",
+            _r3_pp_tp_info(),
+            len(mb_list),
+            forward_only,
+            _from_side_channel,
+            mb_list.padded_mbs is not None,
+            _r3_tensor_sig("routed_experts_batch", routed_experts_batch),
+        )
 
     # Split routed_experts per micro-batch
     per_mb_routed_experts = _split_routed_experts_for_mbs(
@@ -402,6 +523,22 @@ def _r3_forward_backward_batch(
                 else None
             )
 
+            if _r3_verbose() and _r3_should_log("_R3MicroBatchIterator.__next__"):
+                logger.info(
+                    "[R3-STAGE3/_R3MicroBatchIterator] ENTER mb_idx=%d %s "
+                    "re_shape=%s has_orig_mb=%s has_padded_mb=%s "
+                    "has_old_cu_seqlens=%s",
+                    idx,
+                    _r3_pp_tp_info(),
+                    None if re is None else tuple(re.shape),
+                    hasattr(mb_item, "orig_mb")
+                    and isinstance(mb_item.orig_mb, dict),
+                    hasattr(mb_item, "padded_mb")
+                    and isinstance(mb_item.padded_mb, dict),
+                    hasattr(mb_item, "old_cu_seqlens")
+                    and mb_item.old_cu_seqlens is not None,
+                )
+
             # When backward recompute finishes and next forward starts,
             # switch back to REPLAY_FORWARD.
             if RouterReplayHelper.is_replay_backward_action(model_config):
@@ -411,6 +548,16 @@ def _r3_forward_backward_batch(
                 for router in router_list:
                     router.set_router_replay_action(
                         RouterReplayAction.REPLAY_FORWARD
+                    )
+                if _r3_verbose() and _r3_should_log(
+                    "_R3MicroBatchIterator.toggle_to_forward"
+                ):
+                    logger.info(
+                        "[R3-STAGE3/_R3MicroBatchIterator] TOGGLE backward->forward "
+                        "mb_idx=%d %s n_routers=%d",
+                        idx,
+                        _r3_pp_tp_info(),
+                        len(router_list),
                     )
 
             if re is not None:
@@ -428,19 +575,39 @@ def _r3_forward_backward_batch(
                         # to know each sample's actual token count for
                         # extracting from routed_experts.
                         orig_cu = None
+                        orig_cu_src = None
                         if hasattr(mb_item, "old_cu_seqlens") and mb_item.old_cu_seqlens is not None:
                             orig_cu = mb_item.old_cu_seqlens
+                            orig_cu_src = "old_cu_seqlens"
                         elif hasattr(mb_item, "orig_mb") and isinstance(mb_item.orig_mb, dict):
                             orig_cu = mb_item.orig_mb.get("cu_seqlens")
+                            orig_cu_src = "orig_mb.cu_seqlens"
 
                         if orig_cu is None:
                             # Fallback: use padded cu_seqlens directly
                             orig_cu = cu_seqlens
+                            orig_cu_src = "padded_cu_seqlens (fallback)"
+
+                        if _r3_verbose() and _r3_should_log(
+                            "_R3MicroBatchIterator.pre_align"
+                        ):
+                            logger.info(
+                                "[R3-STAGE3/_R3MicroBatchIterator] PRE-ALIGN "
+                                "mb_idx=%d %s orig_cu_src=%s max_seqlen=%d "
+                                "| %s | %s | %s",
+                                idx,
+                                _r3_pp_tp_info(),
+                                orig_cu_src,
+                                max_seqlen,
+                                _r3_tensor_sig("re", re, max_sample=4),
+                                _r3_tensor_sig("orig_cu", orig_cu),
+                                _r3_tensor_sig("padded_cu", cu_seqlens),
+                            )
 
                         # Align routed_experts from left-padded to left-aligned
                         # using the ORIGINAL cu_seqlens (actual token counts).
                         aligned_re = _align_routed_experts_to_mask(
-                            re, orig_cu, max_seqlen,
+                            re, orig_cu, max_seqlen, _r3_mb_idx=idx,
                         )
 
                         # Pass the PADDED cu_seqlens (with TP alignment)
@@ -502,6 +669,13 @@ def _r3_forward_backward_batch(
             for router in router_list:
                 router.set_router_replay_action(
                     RouterReplayAction.REPLAY_BACKWARD
+                )
+            if _r3_verbose() and _r3_should_log("_r3_post_forward_hook"):
+                logger.info(
+                    "[R3-STAGE3/_r3_post_forward_hook] TOGGLE forward->backward "
+                    "%s n_routers=%d",
+                    _r3_pp_tp_info(),
+                    len(router_list),
                 )
 
     for model_chunk in self.model:

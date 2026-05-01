@@ -157,7 +157,7 @@ def extract_routed_experts(
             preprocess_routed_experts_batch,
         )
 
-        return preprocess_routed_experts_batch(
+        result = preprocess_routed_experts_batch(
             routed_experts_np,
             input_ids,
             attention_mask,
@@ -165,6 +165,29 @@ def extract_routed_experts(
             topk=topk,
             compress_dtype=compress_dtype,
         )
+        try:
+            from areal.engine.router_replay_utils import (
+                _r3_should_log,
+                _r3_tensor_sig,
+                _r3_verbose,
+            )
+
+            if _r3_verbose() and _r3_should_log("extract_routed_experts"):
+                logger.info(
+                    "[R3-STAGE1/extract_routed_experts] "
+                    "num_moe_layers=%d topk=%d "
+                    "input_ids_shape=%s attn_sum=%d "
+                    "np_shape=%s | %s",
+                    num_moe_layers,
+                    topk,
+                    tuple(input_ids.shape),
+                    int(attention_mask.sum().item()),
+                    getattr(routed_experts_np, "shape", None),
+                    _r3_tensor_sig("result", result),
+                )
+        except Exception:
+            pass
+        return result
     except Exception:
         logger.warning(
             "[R3] Failed to preprocess routed_experts (shape=%s); skipping.",

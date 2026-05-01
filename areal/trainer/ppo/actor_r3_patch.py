@@ -88,6 +88,35 @@ def split_routed_experts_for_minibatches(
         [r.shape[0] for r in result],
         "None" if forward_indices is None else f"len={len(forward_indices)}",
     )
+    try:
+        from areal.engine.router_replay_utils import (
+            _r3_pp_tp_info,
+            _r3_should_log,
+            _r3_tensor_sig,
+            _r3_verbose,
+        )
+
+        if _r3_verbose() and _r3_should_log(
+            "split_routed_experts_for_minibatches"
+        ):
+            logger.info(
+                "[R3-STAGE2/split_routed_experts_for_minibatches] %s "
+                "input_shape=%s n_mbs=%d forward_indices=%s "
+                "per_mb_shapes=%s | %s",
+                _r3_pp_tp_info(),
+                tuple(routed_experts.shape),
+                n_mbs,
+                "None"
+                if forward_indices is None
+                else (
+                    f"len={len(forward_indices)} "
+                    f"first16={forward_indices[:16].tolist() if hasattr(forward_indices,'tolist') else list(forward_indices)[:16]}"
+                ),
+                [tuple(r.shape) for r in result],
+                _r3_tensor_sig("routed_experts", routed_experts, max_sample=4),
+            )
+    except Exception:
+        pass
     return result
 
 

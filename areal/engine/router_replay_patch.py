@@ -122,6 +122,22 @@ class RouterReplay:
         """Set the replay action for all router instances."""
         for r in RouterReplay.router_instances:
             r.set_router_replay_action(action)
+        try:
+            from areal.engine.router_replay_utils import (
+                _r3_pp_tp_info,
+                _r3_should_log,
+            )
+
+            if _r3_should_log(f"set_global_router_replay_action/{action.value}"):
+                logger.info(
+                    "[R3-STAGE4/set_global_router_replay_action] %s action=%s "
+                    "applied_to=%d router_instances",
+                    _r3_pp_tp_info(),
+                    action.value,
+                    len(RouterReplay.router_instances),
+                )
+        except Exception:
+            pass
 
     @staticmethod
     def clear_global_router_replay_action() -> None:
@@ -140,6 +156,35 @@ class RouterReplay:
         """Sets the target topk indices for replay."""
         self.target_topk_idx = topk_indices
         self.replay_backward_list.append(topk_indices)
+        # Cheap diagnostic: record every set in first few layers/mb. Gated
+        # via _r3_should_log so steady-state overhead is ~one integer
+        # increment.
+        try:
+            from areal.engine.router_replay_utils import (
+                _r3_pp_tp_info,
+                _r3_should_log,
+                _r3_tensor_sig,
+                _r3_zero_row_stats,
+            )
+
+            if _r3_should_log("RouterReplay.set_target_indices"):
+                # instance index in the class-level list tells us which
+                # MoE layer this replay slot refers to
+                try:
+                    inst_idx = RouterReplay.router_instances.index(self)
+                except ValueError:
+                    inst_idx = -1
+                logger.info(
+                    "[R3-STAGE3b/set_target_indices] inst#%d %s %s | %s | "
+                    "backward_queue_len=%d",
+                    inst_idx,
+                    _r3_pp_tp_info(),
+                    _r3_zero_row_stats(topk_indices),
+                    _r3_tensor_sig("topk_indices", topk_indices),
+                    len(self.replay_backward_list),
+                )
+        except Exception:
+            pass
 
     def get_recorded_indices(self) -> torch.Tensor | None:
         return self.recorded_topk_idx
@@ -162,6 +207,80 @@ class RouterReplay:
 # ===================================================================
 # Patched routing implementation
 # ===================================================================
+
+
+def _R3_routing_log(
+    action_name: str,
+    *,
+    scores: torch.Tensor,
+    top_indices: torch.Tensor,
+    topk: int,
+    compute_topk_fn,
+    num_groups=None,
+    group_topk=None,
+) -> None:
+    """Rate-limited diagnostic for the replay branches.
+
+    Key quantities:
+      * ``shape_match``   -- does target_topk_idx align with this layer's
+        token count? If NOT, replay is being fed the wrong slab.
+      * ``zero_rows``     -- fraction of all-zero rows in the replay
+        indices; zero rows collapse routing to expert 0.
+      * ``live_vs_replay`` -- overlap between replay top-k and the live
+        top-k the router would have picked right now. 100% = no staleness
+        (rollout weights == train weights). 0% = total mismatch.
+    """
+    from areal.engine.router_replay_utils import (
+        _r3_call_count,
+        _r3_pp_tp_info,
+        _r3_should_log,
+        _r3_tensor_sig,
+        _r3_verbose,
+        _r3_zero_row_stats,
+        _R3_ROUTER_LAYER_LIMIT,
+    )
+
+    if not _r3_verbose():
+        return
+    key = f"patched_routing/{action_name}"
+    call_n = _r3_call_count(key)
+    # We always want an early, concentrated burst of per-layer details at
+    # startup (helps catch first-step config problems) and then a sparse
+    # steady-state sample.
+    if not _r3_should_log(key):
+        return
+    with torch.no_grad():
+        shape_match = top_indices.shape[0] == scores.shape[0]
+        if shape_match:
+            try:
+                _, live_top = compute_topk_fn(
+                    scores, topk, num_groups=num_groups, group_topk=group_topk
+                )
+                # per-token overlap ratio
+                set_live = live_top.sort(dim=-1).values
+                set_rep = top_indices.sort(dim=-1).values
+                # equality per (token, slot)
+                overlap = (set_live == set_rep).float().mean().item()
+            except Exception as e:
+                overlap = f"err:{e}"
+        else:
+            overlap = None
+    logger.info(
+        "[R3-STAGE4/patched_routing] %s call#%d %s "
+        "scores_shape=%s topk=%d target_shape=%s shape_match=%s "
+        "live_vs_replay_topk_overlap=%s %s | %s | %s",
+        action_name,
+        call_n,
+        _r3_pp_tp_info(),
+        tuple(scores.shape),
+        topk,
+        tuple(top_indices.shape),
+        shape_match,
+        overlap,
+        _r3_zero_row_stats(top_indices),
+        _r3_tensor_sig("scores", scores, max_sample=4),
+        _r3_tensor_sig("top_indices", top_indices, max_sample=8),
+    )
 
 
 def _patched_topk_routing_with_score_function(
@@ -220,6 +339,15 @@ def _patched_topk_routing_with_score_function(
             # Use the provided indices for replay
             top_indices = router_replay.target_topk_idx
             top_indices = top_indices.to(scores.device)
+            _R3_routing_log(
+                "REPLAY_FORWARD",
+                scores=scores,
+                top_indices=top_indices,
+                topk=topk,
+                compute_topk_fn=_compute_topk,
+                num_groups=num_groups,
+                group_topk=group_topk,
+            )
             probs = scores.gather(1, top_indices)
 
             return probs, top_indices
@@ -235,6 +363,15 @@ def _patched_topk_routing_with_score_function(
             # Use the last recorded indices for backward replay
             top_indices = router_replay.replay_backward_list.pop(0)
             top_indices = top_indices.to(scores.device)
+            _R3_routing_log(
+                "REPLAY_BACKWARD",
+                scores=scores,
+                top_indices=top_indices,
+                topk=topk,
+                compute_topk_fn=_compute_topk,
+                num_groups=num_groups,
+                group_topk=group_topk,
+            )
             probs = scores.gather(1, top_indices)
             return probs, top_indices
 

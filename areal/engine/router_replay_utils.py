@@ -15,6 +15,7 @@ from __future__ import annotations
 
 import inspect
 import logging
+import os
 from typing import Optional
 
 import torch
@@ -22,6 +23,166 @@ import torch
 from areal.engine.router_replay_patch import RouterReplay, RouterReplayAction
 
 logger = logging.getLogger(__name__)
+
+
+# ===================================================================
+# R3 detailed-logging helpers
+# ===================================================================
+# These helpers are used by EVERY R3 file (this module, router_replay_patch,
+# megatron_engine_r3_patch, actor_r3_patch, actor.py, rlvr_r3_patch) so that
+# all stages of the pipeline produce fingerprints in a consistent format.
+#
+# Controls (all opt-in via env vars so prod perf is not affected unless you
+# deliberately enable):
+#
+#   AREAL_R3_VERBOSE=1              -- master switch; enables everything below.
+#                                      Default: 1 (ON) so that if someone cares
+#                                      to run with R3 and grep logs, they do
+#                                      not need to set anything extra.
+#   AREAL_R3_LOG_FIRST_N=30         -- for rate-limited hot paths, always log
+#                                      the first N calls per key.
+#   AREAL_R3_LOG_EVERY=100          -- after the first N, log every Nth call.
+#   AREAL_R3_TENSOR_SAMPLE=8        -- how many leading elements to include in
+#                                      a tensor signature.
+#   AREAL_R3_ROUTER_LAYER_LIMIT=3   -- in patched_topk_routing, only print
+#                                      per-layer details for up to the first
+#                                      K routing calls of each type per step
+#                                      (layer idx is approximated via a
+#                                      per-action counter).
+# ===================================================================
+
+
+def _r3_verbose() -> bool:
+    return os.environ.get("AREAL_R3_VERBOSE", "1") != "0"
+
+
+_R3_LOG_CALL_COUNTS: dict[str, int] = {}
+_R3_LOG_FIRST_N = int(os.environ.get("AREAL_R3_LOG_FIRST_N", "30"))
+_R3_LOG_EVERY = int(os.environ.get("AREAL_R3_LOG_EVERY", "100"))
+_R3_TENSOR_SAMPLE = int(os.environ.get("AREAL_R3_TENSOR_SAMPLE", "8"))
+_R3_ROUTER_LAYER_LIMIT = int(os.environ.get("AREAL_R3_ROUTER_LAYER_LIMIT", "3"))
+
+
+def _r3_should_log(key: str) -> bool:
+    """Rate-limited logging gate. Returns True for the first
+    ``AREAL_R3_LOG_FIRST_N`` calls against ``key``, then True once every
+    ``AREAL_R3_LOG_EVERY`` calls thereafter. Monotonic per-process counter.
+    """
+    if not _r3_verbose():
+        return False
+    n = _R3_LOG_CALL_COUNTS.get(key, 0) + 1
+    _R3_LOG_CALL_COUNTS[key] = n
+    if n <= _R3_LOG_FIRST_N:
+        return True
+    return (n % max(_R3_LOG_EVERY, 1)) == 0
+
+
+def _r3_call_count(key: str) -> int:
+    return _R3_LOG_CALL_COUNTS.get(key, 0)
+
+
+def _r3_tensor_sig(name: str, t, *, max_sample: int | None = None) -> str:
+    """Compact human-readable fingerprint for a tensor or numpy array.
+
+    Intentionally cheap: performs ONE ``.detach().cpu()`` copy and one
+    reduction so it is safe to call from hot paths (still, prefer to gate
+    via ``_r3_should_log``).
+    """
+    if t is None:
+        return f"{name}=None"
+    sample_n = _R3_TENSOR_SAMPLE if max_sample is None else max_sample
+    try:
+        if isinstance(t, torch.Tensor):
+            tc = t.detach()
+            if tc.device.type != "cpu":
+                tc = tc.to("cpu", non_blocking=False)
+            flat = tc.reshape(-1)
+            total = int(flat.numel())
+            if total == 0:
+                return f"{name}(shape={tuple(t.shape)}, dtype={t.dtype}, empty)"
+            nnz = int((flat != 0).sum().item())
+            if tc.dtype in (
+                torch.float16,
+                torch.float32,
+                torch.float64,
+                torch.bfloat16,
+            ):
+                checksum = float(flat.float().double().sum().item())
+                maxv = float(flat.float().abs().max().item())
+                sample = [round(v, 6) for v in flat[:sample_n].float().tolist()]
+            else:
+                checksum = int(flat.long().sum().item())
+                maxv = int(flat.long().abs().max().item())
+                sample = flat[:sample_n].tolist()
+            return (
+                f"{name}(shape={tuple(t.shape)}, dtype={t.dtype}, "
+                f"device={t.device}, nnz={nnz}/{total}, "
+                f"sum={checksum}, |max|={maxv}, first{len(sample)}={sample})"
+            )
+        # numpy or generic array-like
+        if hasattr(t, "shape") and hasattr(t, "dtype"):
+            import numpy as np
+
+            arr = t if isinstance(t, np.ndarray) else np.asarray(t)
+            flat = arr.reshape(-1)
+            total = int(flat.size)
+            if total == 0:
+                return f"{name}(shape={arr.shape}, dtype={arr.dtype}, empty, numpy)"
+            nnz = int((flat != 0).sum())
+            checksum = int(flat.astype("int64").sum()) if np.issubdtype(
+                arr.dtype, np.integer
+            ) else float(flat.astype("float64").sum())
+            maxv = (
+                int(np.abs(flat).max())
+                if np.issubdtype(arr.dtype, np.integer)
+                else float(np.abs(flat).max())
+            )
+            sample = flat[:sample_n].tolist()
+            return (
+                f"{name}(shape={tuple(arr.shape)}, dtype={arr.dtype}, numpy, "
+                f"nnz={nnz}/{total}, sum={checksum}, |max|={maxv}, "
+                f"first{len(sample)}={sample})"
+            )
+    except Exception as e:  # pragma: no cover - diagnostic helper must not raise
+        return f"{name}=<sig-err:{type(e).__name__}:{e}>"
+    return f"{name}={type(t).__name__}"
+
+
+def _r3_zero_row_stats(top_indices: torch.Tensor) -> str:
+    """Returns a string describing the count of all-zero rows in a
+    ``(num_tokens, topk)`` target_topk_idx tensor. All-zero rows are the
+    smoking gun for zero-fill hazard.
+    """
+    if top_indices is None or top_indices.ndim < 2:
+        return "zero_row_stats=N/A"
+    try:
+        with torch.no_grad():
+            zero_rows = (top_indices == 0).all(dim=-1)
+            total = int(zero_rows.numel())
+            z = int(zero_rows.sum().item())
+        return f"zero_rows={z}/{total} ({100.0*z/max(total,1):.2f}%)"
+    except Exception as e:
+        return f"zero_row_stats=<err:{e}>"
+
+
+def _r3_pp_tp_info(tf_config=None, vp_rank=None) -> str:
+    """Short PP/TP/DP/SP/EP context string for log lines."""
+    try:
+        from megatron.core import parallel_state as mpu
+
+        pp = mpu.get_pipeline_model_parallel_world_size()
+        pp_rank = mpu.get_pipeline_model_parallel_rank()
+        tp = mpu.get_tensor_model_parallel_world_size()
+        tp_rank = mpu.get_tensor_model_parallel_rank()
+        cp = getattr(mpu, "get_context_parallel_world_size", lambda: 1)()
+        dp = mpu.get_data_parallel_world_size()
+        dp_rank = mpu.get_data_parallel_rank()
+        return (
+            f"pp={pp_rank}/{pp} tp={tp_rank}/{tp} cp={cp} dp={dp_rank}/{dp}"
+            + (f" vp={vp_rank}" if vp_rank is not None else "")
+        )
+    except Exception:
+        return "pp=?/? tp=?/?"
 
 
 # ===================================================================
@@ -275,6 +436,30 @@ def set_router_replay_data(
 
         total_aligned = sum(aligned_lens)
 
+        if _r3_verbose() and _r3_should_log("set_router_replay_data/ENTER"):
+            logger.info(
+                "[R3-STAGE3/set_router_replay_data] ENTER call#%d %s "
+                "layers_topk_idx=(bs=%d, max_seq=%d, L=%d, K=%d) dtype=%s "
+                "n_cu_entries=%d n_seqs_in_cu=%d seq_align_to=%d "
+                "seq_lens[:8]=%s aligned_lens[:8]=%s total_aligned=%d "
+                "vp_rank=%s | %s",
+                _r3_call_count("set_router_replay_data/ENTER"),
+                _r3_pp_tp_info(tf_config, vp_rank),
+                bs_re,
+                layers_topk_idx.shape[1],
+                num_layers,
+                topk,
+                layers_topk_idx.dtype,
+                n_cu_entries,
+                n_seqs_in_cu,
+                seq_align_to,
+                seq_lens[:8],
+                aligned_lens[:8],
+                total_aligned,
+                vp_rank,
+                _r3_tensor_sig("cu_seqlens", cu_seqlens),
+            )
+
         # Pack routed_experts using cu_seqlens-aligned layout.
         # layers_topk_idx is left-ALIGNED: real tokens at positions [0, seq_len).
         # For each sequence i, we take the first seq_lens[i] tokens and place
@@ -303,6 +488,27 @@ def set_router_replay_data(
         for i in range(bs_re, n_seqs_in_cu):
             aligned_offset += aligned_lens[i]
 
+        if _r3_verbose() and _r3_should_log("set_router_replay_data/PACKED"):
+            with torch.no_grad():
+                # Count global all-zero rows across ALL layers AND topk slots.
+                per_row_zero = (
+                    (packed == 0).reshape(packed.shape[0], -1).all(dim=-1)
+                )
+                zrows = int(per_row_zero.sum().item())
+                total_rows = int(per_row_zero.numel())
+            logger.info(
+                "[R3-STAGE3/set_router_replay_data] PACKED "
+                "packed=(total_aligned=%d, L=%d, K=%d) global_zero_rows=%d/%d "
+                "(%.2f%%) | %s",
+                packed.shape[0],
+                packed.shape[1],
+                packed.shape[2],
+                zrows,
+                total_rows,
+                100.0 * zrows / max(total_rows, 1),
+                _r3_tensor_sig("packed", packed),
+            )
+
         # Step 2: Scatter to SP ranks
         packed = packed.to(device)
         tp_size = mpu.get_tensor_model_parallel_world_size()
@@ -315,6 +521,15 @@ def set_router_replay_data(
 
         # Step 3: Permute to (num_layers, local_tokens_count, topk)
         layers_topk = local_tokens.permute(1, 0, 2)
+
+        if _r3_verbose() and _r3_should_log("set_router_replay_data/SCATTER"):
+            logger.info(
+                "[R3-STAGE3/set_router_replay_data] POST-SCATTER "
+                "tp_size=%d local_tokens=%s layers_topk=%s",
+                tp_size,
+                _r3_tensor_sig("local_tokens", local_tokens),
+                _r3_tensor_sig("layers_topk", layers_topk),
+            )
 
         # Step 4: Distribute to RouterReplay instances for local PP layers
         local_info = get_current_rank_layer_info(tf_config, vp_rank)
@@ -338,6 +553,7 @@ def set_router_replay_data(
         moe_idx = sum(1 for i in range(offset) if is_moe_layer(tf_config, i))
 
         router_offset = 0
+        dispatched = []  # list of (layer_idx, idx_into_layers_topk, zero_row_stats)
         for layer_idx in range(offset, end):
             if not is_moe_layer(tf_config, layer_idx):
                 continue
@@ -360,7 +576,17 @@ def set_router_replay_data(
                 moe_idx += 1
                 router_offset += 1
                 continue
-            router.set_target_indices(layers_topk[idx].to(torch.int64))
+            slab = layers_topk[idx].to(torch.int64)
+            router.set_target_indices(slab)
+            if _r3_verbose() and _r3_should_log("set_router_replay_data/DISPATCH"):
+                dispatched.append(
+                    (
+                        layer_idx,
+                        idx,
+                        _r3_zero_row_stats(slab),
+                        _r3_tensor_sig(f"target[L={layer_idx}]", slab),
+                    )
+                )
             router_offset += 1
             moe_idx += 1
 
@@ -374,6 +600,23 @@ def set_router_replay_data(
             end,
             tp_size,
         )
+        if _r3_verbose() and dispatched:
+            # Only log first couple of dispatched layers in detail; keep
+            # the rest summarised.
+            head = dispatched[:_R3_ROUTER_LAYER_LIMIT]
+            logger.info(
+                "[R3-STAGE3/set_router_replay_data] DISPATCH %s "
+                "router_offset=%d len(router_list)=%d index_by_layer=%s "
+                "first_layers=%s ... (total dispatched=%d)",
+                _r3_pp_tp_info(tf_config, vp_rank),
+                router_offset,
+                len(router_list),
+                index_by_layer,
+                [
+                    (lidx, j, zr, sig) for lidx, j, zr, sig in head
+                ],
+                len(dispatched),
+            )
 
 
 # ===================================================================
@@ -400,6 +643,19 @@ def setup_per_microbatch_replay_forward(
         seq_align_to: Per-sequence TP alignment factor.
     """
     routed_experts = routed_experts.to(torch.int32)
+    if _r3_verbose() and _r3_should_log("setup_per_microbatch_replay_forward"):
+        with torch.no_grad():
+            per_row_zero = (routed_experts == 0).all(dim=-1).all(dim=-1)
+        logger.info(
+            "[R3-STAGE3/setup_per_microbatch_replay_forward] ENTER %s "
+            "routed_experts=%s cu_seqlens=%s seq_align_to=%s "
+            "per_sample_zero_rows=%s",
+            _r3_pp_tp_info(tf_config, vp_rank),
+            _r3_tensor_sig("routed_experts", routed_experts),
+            _r3_tensor_sig("cu_seqlens", cu_seqlens),
+            seq_align_to,
+            [int(x.sum().item()) for x in per_row_zero][:8],
+        )
     set_router_replay_data(
         routed_experts, cu_seqlens, tf_config, vp_rank,
         seq_align_to=seq_align_to,
@@ -454,11 +710,29 @@ def preprocess_routed_experts_batch(
     import numpy as np
 
     if routed_experts_np is None:
+        if _r3_verbose():
+            logger.info("[R3-STAGE1/preprocess] routed_experts_np=None, returning None")
         return None
 
     seq_len = input_ids.shape[1]
     num_sgl_tokens = routed_experts_np.shape[0]
     flat_dim = routed_experts_np.shape[1]
+
+    if _r3_verbose():
+        logger.info(
+            "[R3-STAGE1/preprocess] ENTER "
+            "seq_len=%d num_sgl_tokens=%d flat_dim=%d num_moe_layers=%s topk=%s "
+            "expected_flat=%s | %s | %s | %s",
+            seq_len,
+            num_sgl_tokens,
+            flat_dim,
+            num_moe_layers,
+            topk,
+            (num_moe_layers or 0) * (topk or 0),
+            _r3_tensor_sig("input_ids", input_ids),
+            _r3_tensor_sig("attention_mask", attention_mask),
+            _r3_tensor_sig("routed_experts_np", routed_experts_np),
+        )
 
     expected_flat = num_moe_layers * topk
     if flat_dim != expected_flat:
@@ -511,5 +785,35 @@ def preprocess_routed_experts_batch(
         real_tokens,
         right_pad,
     )
+
+    if _r3_verbose():
+        # NOTE: for R3 correctness check. We expect num_sgl_tokens =
+        # real_tokens - 1 (SGLang drops the logprob of the very last
+        # generated token). Anything else means the routing -> token
+        # alignment is not what we think it is.
+        tail_row_is_zero = None
+        try:
+            tail_slice = padded[0, real_tokens - 1] if real_tokens > 0 else None
+            if tail_slice is not None:
+                tail_row_is_zero = bool((tail_slice == 0).all().item())
+        except Exception:
+            tail_row_is_zero = "err"
+        # All-zero row stats across the seq_len axis for this sample.
+        with torch.no_grad():
+            per_row_zero = (padded[0] == 0).all(dim=-1).all(dim=-1)
+            zero_rows_count = int(per_row_zero.sum().item())
+        logger.info(
+            "[R3-STAGE1/preprocess] EXIT "
+            "num_sgl_tokens=%d real_tokens=%d delta=%d right_pad=%d "
+            "tail_real_row_all_zero=%s zero_rows_total=%d/%d | %s",
+            num_sgl_tokens,
+            real_tokens,
+            real_tokens - num_sgl_tokens,
+            right_pad,
+            tail_row_is_zero,
+            zero_rows_count,
+            seq_len,
+            _r3_tensor_sig("padded", padded),
+        )
 
     return padded
