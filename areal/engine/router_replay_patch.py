@@ -153,12 +153,35 @@ class RouterReplay:
         self.recorded_topk_idx: torch.Tensor | None = None
         self.router_replay_action: RouterReplayAction | None = None
         self.replay_backward_list: list[torch.Tensor] = []
+        # 1-D bool mask (shape=(num_tokens,)) marking which
+        # rows of ``target_topk_idx`` correspond to real tokens.  Padded
+        # rows (seq-alignment slack + batch padding) must not be forced to
+        # the recorded top-k (which is [0,...,0]); instead we let them fall
+        # back to the live router output so they produce no replay signal.
+        self.target_valid_mask: torch.Tensor | None = None
+        self.replay_backward_mask_list: list[torch.Tensor | None] = []
         RouterReplay.router_instances.append(self)
 
-    def set_target_indices(self, topk_indices: torch.Tensor) -> None:
-        """Sets the target topk indices for replay."""
+    def set_target_indices(
+        self,
+        topk_indices: torch.Tensor,
+        valid_mask: torch.Tensor | None = None,
+    ) -> None:
+        """Sets the target topk indices (and optional row-validity mask) for replay.
+
+        Args:
+            topk_indices: ``(num_tokens, topk)`` replay indices.
+            valid_mask: Optional ``(num_tokens,)`` bool tensor. ``True`` means
+                the row is a real token and replay should override live routing;
+                ``False`` means the row is padding (batch or TP-alignment slack)
+                and replay MUST fall back to live routing to avoid forcing those
+                rows to expert 0. When ``None``, all rows are treated as real
+                (legacy behaviour).
+        """
         self.target_topk_idx = topk_indices
+        self.target_valid_mask = valid_mask
         self.replay_backward_list.append(topk_indices)
+        self.replay_backward_mask_list.append(valid_mask)
         # Cheap diagnostic: record every set in first few layers/mb. Gated
         # via _r3_should_log so steady-state overhead is ~one integer
         # increment.
@@ -198,7 +221,9 @@ class RouterReplay:
     def clear_indices(self) -> None:
         self.recorded_topk_idx = None
         self.target_topk_idx = None
+        self.target_valid_mask = None
         self.replay_backward_list = []
+        self.replay_backward_mask_list = []
 
     def set_router_replay_action(self, action: RouterReplayAction) -> None:
         self.router_replay_action = action
@@ -342,6 +367,19 @@ def _patched_topk_routing_with_score_function(
             # Use the provided indices for replay
             top_indices = router_replay.target_topk_idx
             top_indices = top_indices.to(scores.device)
+            # splice padded rows with the LIVE router top-k so
+            # that TP-alignment / batch padding slack (which was recorded as
+            # all-zeros) does not force those rows to expert 0. 
+            valid_mask = getattr(router_replay, "target_valid_mask", None)
+            if valid_mask is not None and valid_mask.shape[0] == top_indices.shape[0]:
+                _, live_top = _compute_topk(
+                    scores, topk, num_groups=num_groups, group_topk=group_topk
+                )
+                top_indices = torch.where(
+                    valid_mask.to(scores.device).unsqueeze(-1),
+                    top_indices,
+                    live_top,
+                )
             _R3_routing_log(
                 "REPLAY_FORWARD",
                 scores=scores,
@@ -366,6 +404,28 @@ def _patched_topk_routing_with_score_function(
             # Use the last recorded indices for backward replay
             top_indices = router_replay.replay_backward_list.pop(0)
             top_indices = top_indices.to(scores.device)
+            # pop the matching per-row validity mask (if any)
+            # so the backward recompute sees the same spliced indices as the
+            # original forward pass.  Without this, activation-checkpoint
+            # recomputation re-introduces the all-zero padding rows and the
+            # gradient path contradicts the forward pass.
+            bw_mask_list = getattr(router_replay, "replay_backward_mask_list", None)
+            if bw_mask_list:
+                bw_valid_mask = bw_mask_list.pop(0)
+            else:
+                bw_valid_mask = None
+            if (
+                bw_valid_mask is not None
+                and bw_valid_mask.shape[0] == top_indices.shape[0]
+            ):
+                _, live_top = _compute_topk(
+                    scores, topk, num_groups=num_groups, group_topk=group_topk
+                )
+                top_indices = torch.where(
+                    bw_valid_mask.to(scores.device).unsqueeze(-1),
+                    top_indices,
+                    live_top,
+                )
             _R3_routing_log(
                 "REPLAY_BACKWARD",
                 scores=scores,

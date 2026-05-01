@@ -472,6 +472,22 @@ def set_router_replay_data(
             dtype=layers_topk_idx.dtype,
             device=layers_topk_idx.device,
         )
+        # ----------------------------------------------------------------
+        # build a 1-D validity mask in lock-step with ``packed``.
+        # True  = real token position (safe to replay).
+        # False = padding (per-seq TP alignment slack OR batch-level padding
+        #         sequence OR tail rows beyond the real payload).
+        #
+        # After ``scatter_to_sequence_parallel_region``, this mask is sliced
+        # the same way as ``packed`` so each TP rank knows which of its local
+        # rows are real.  Rows with mask==False MUST NOT be forced to the
+        # recorded top-k (which is [0,0,...,0] for padding)
+        # ----------------------------------------------------------------
+        valid_mask = torch.zeros(
+            total_aligned,
+            dtype=torch.bool,
+            device=layers_topk_idx.device,
+        )
 
         aligned_offset = 0
         for i in range(min(n_seqs_in_cu, bs_re)):
@@ -484,10 +500,14 @@ def set_router_replay_data(
             packed[aligned_offset : aligned_offset + actual_len] = (
                 layers_topk_idx[i, :actual_len]
             )
+            # Only the real-token span is marked valid; the per-seq
+            # TP-alignment slack (aligned_lens[i] - actual_len) stays False.
+            valid_mask[aligned_offset : aligned_offset + actual_len] = True
             aligned_offset += aligned_lens[i]
 
         # For any extra sequences in cu_seqlens beyond bs_re (batch padding),
-        # the packed tensor already has zeros at those positions.
+        # the packed tensor already has zeros at those positions and
+        # ``valid_mask`` stays False for that entire span.
         for i in range(bs_re, n_seqs_in_cu):
             aligned_offset += aligned_lens[i]
 
@@ -499,37 +519,54 @@ def set_router_replay_data(
                 )
                 zrows = int(per_row_zero.sum().item())
                 total_rows = int(per_row_zero.numel())
+                n_valid = int(valid_mask.sum().item())
             logger.info(
                 "[R3-STAGE3/set_router_replay_data] PACKED "
                 "packed=(total_aligned=%d, L=%d, K=%d) global_zero_rows=%d/%d "
-                "(%.2f%%) | %s",
+                "(%.2f%%) valid_rows=%d/%d (%.2f%%) | %s",
                 packed.shape[0],
                 packed.shape[1],
                 packed.shape[2],
                 zrows,
                 total_rows,
                 100.0 * zrows / max(total_rows, 1),
+                n_valid,
+                total_rows,
+                100.0 * n_valid / max(total_rows, 1),
                 _r3_tensor_sig("packed", packed),
             )
 
         # Step 2: Scatter to SP ranks
         packed = packed.to(device)
+        valid_mask = valid_mask.to(device)
         tp_size = mpu.get_tensor_model_parallel_world_size()
         if tp_size > 1:
             from megatron.core.tensor_parallel import scatter_to_sequence_parallel_region
             local_tokens = scatter_to_sequence_parallel_region(packed)
+            # Scatter the mask on dim-0 as well.  ``scatter_to_sequence_parallel_region``
+            # expects a tensor with a sequence dimension on dim 0; promote the
+            # bool mask to the same dtype as ``packed`` to keep the op's
+            # collective-compat contract intact, then cast back.
+            mask_buf = valid_mask.to(packed.dtype).unsqueeze(-1).unsqueeze(-1)
+            local_mask = scatter_to_sequence_parallel_region(mask_buf)[..., 0, 0].bool()
         else:
             local_tokens = packed
+            local_mask = valid_mask
         # local_tokens: (local_tokens_count, num_layers, topk)
+        # local_mask:   (local_tokens_count,)
 
         # Step 3: Permute to (num_layers, local_tokens_count, topk)
         layers_topk = local_tokens.permute(1, 0, 2)
 
         if _r3_verbose() and _r3_should_log("set_router_replay_data/SCATTER"):
+            with torch.no_grad():
+                n_local_valid = int(local_mask.sum().item())
             logger.info(
                 "[R3-STAGE3/set_router_replay_data] POST-SCATTER "
-                "tp_size=%d local_tokens=%s layers_topk=%s",
+                "tp_size=%d local_valid=%d/%d local_tokens=%s layers_topk=%s",
                 tp_size,
+                n_local_valid,
+                local_mask.numel(),
                 _r3_tensor_sig("local_tokens", local_tokens),
                 _r3_tensor_sig("layers_topk", layers_topk),
             )
@@ -580,7 +617,7 @@ def set_router_replay_data(
                 router_offset += 1
                 continue
             slab = layers_topk[idx].to(torch.int64)
-            router.set_target_indices(slab)
+            router.set_target_indices(slab, valid_mask=local_mask)
             if _r3_verbose() and _r3_should_log("set_router_replay_data/DISPATCH"):
                 dispatched.append(
                     (
