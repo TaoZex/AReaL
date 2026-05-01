@@ -193,17 +193,25 @@ class PPOActor:
         loss_mask = data.get("loss_mask")
         if rollout_logp is None or loss_mask is None:
             return
-        # engine.forward returns logprobs aligned to ``roll(input_ids, -1)`` -
-        # i.e. position t holds the logprob of token t+1. ``data["logprobs"]``
-        # from the inference engine follows the same pre-roll convention, so
-        # the two tensors are directly comparable. ``loss_mask`` in ``data``
-        # has not yet been shifted (that happens in ``_compute_advantages``),
-        # so roll it here to align the valid-token mask with the logprobs.
+        # ``engine.forward`` returns logprobs aligned to ``roll(input_ids, -1)``:
+        # slot ``t`` holds ``log p(input_ids[t+1])``. The rollout-side
+        # ``data["logprobs"]`` is NOT pre-rolled -- slot ``t`` holds
+        # ``log p(input_ids[t])`` (SGLang returns one logprob per generated
+        # token at the position that consumed that token). To compare the two
+        # at the SAME token we must shift ``rollout_logp`` left by 1, mirroring
+        # ``_compute_advantages`` which does exactly ``torch.roll(data["logprobs"], -1)``
+        # before feeding it into the PPO loss.
+        #
+        # Likewise ``loss_mask`` in ``data`` is in the unrolled frame (1 at
+        # response-token positions), and must also be rolled by -1 so that
+        # slot ``t`` marks "this slot's logprob is for a response token".
         shifted_mask = torch.roll(loss_mask, shifts=-1, dims=-1).bool()
         if shifted_mask.shape != train_logp.shape:
             return
-        # Shape-align rollout logprobs (dtype may differ across backends).
-        rollout_logp_f = rollout_logp.to(train_logp.dtype)
+        # Shape-align + convention-align rollout logprobs.
+        rollout_logp_f = torch.roll(
+            rollout_logp.to(train_logp.dtype), shifts=-1, dims=-1
+        )
         if rollout_logp_f.shape != train_logp.shape:
             return
 
