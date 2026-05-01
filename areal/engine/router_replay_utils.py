@@ -511,19 +511,48 @@ def set_router_replay_data(
         for i in range(bs_re, n_seqs_in_cu):
             aligned_offset += aligned_lens[i]
 
+        # ----------------------------------------------------------------
+        # strike "structurally all-zero" rows from the
+        # validity mask even when they fall inside ``[0, seq_len)``.
+        #
+        # Motivation: SGLang's async rollout does NOT record routing for the
+        # last generated token of each sequence (the EOS / boundary token)
+        # because its routing metadata is finalised AFTER the forward pass
+        # that produces it.  That leaves exactly one all-zero tail row per
+        # sequence inside the "valid" span (evidence: every rollout EXIT
+        # log shows ``tail_real_row_all_zero=True zero_rows_total=1/N``).
+        # Plan A already masks the per-seq TP alignment slack and batch
+        # padding sequences, but those tail rows slip through: they are
+        # recorded positions whose routing happens to be [0,...,0] for
+        # every one of the ``L * K`` slots.
+        #
+        # Because Moonlight-16B has 27 MoE layers with top-6 routing to 64
+        # experts and ``torch.topk`` returns distinct indices, a real token
+        # producing [0,0,0,0,0,0] across all 27 layers has probability
+        # essentially 0.  It is safe -- and correct -- to treat every such
+        # row as a recording gap and fall back to the LIVE router top-k
+        # during replay, exactly like padding rows.  This keeps the
+        # forward/backward spliced indices consistent (both branches see
+        # the same ``target_valid_mask``) and restores the low
+        # ``mean_abs_diff`` profile on every micro-batch.
+        # ----------------------------------------------------------------
+        with torch.no_grad():
+            row_all_zero = (
+                (packed == 0).reshape(packed.shape[0], -1).all(dim=-1)
+            )
+            n_strike = int((valid_mask & row_all_zero).sum().item())
+            valid_mask = valid_mask & (~row_all_zero)
+
         if _r3_verbose() and _r3_should_log("set_router_replay_data/PACKED"):
             with torch.no_grad():
                 # Count global all-zero rows across ALL layers AND topk slots.
-                per_row_zero = (
-                    (packed == 0).reshape(packed.shape[0], -1).all(dim=-1)
-                )
-                zrows = int(per_row_zero.sum().item())
-                total_rows = int(per_row_zero.numel())
+                zrows = int(row_all_zero.sum().item())
+                total_rows = int(row_all_zero.numel())
                 n_valid = int(valid_mask.sum().item())
             logger.info(
                 "[R3-STAGE3/set_router_replay_data] PACKED "
                 "packed=(total_aligned=%d, L=%d, K=%d) global_zero_rows=%d/%d "
-                "(%.2f%%) valid_rows=%d/%d (%.2f%%) | %s",
+                "(%.2f%%) valid_rows=%d/%d (%.2f%%) struck_tail_rows=%d | %s",
                 packed.shape[0],
                 packed.shape[1],
                 packed.shape[2],
@@ -533,6 +562,7 @@ def set_router_replay_data(
                 n_valid,
                 total_rows,
                 100.0 * n_valid / max(total_rows, 1),
+                n_strike,
                 _r3_tensor_sig("packed", packed),
             )
 
