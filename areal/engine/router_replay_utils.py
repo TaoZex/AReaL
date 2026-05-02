@@ -189,6 +189,162 @@ def _r3_pp_tp_info(tf_config=None, vp_rank=None) -> str:
 
 
 # ===================================================================
+# Root-cause hunting helpers (v2 — per-sample & per-mb fingerprints)
+# ===================================================================
+# We need to pinpoint whether the R3 replay indices that reach the router
+# are the SAME bytes as those the rollout engine produced for the SAME
+# sample.  The cheapest reliable way to do this is a per-sample 64-bit
+# fold-hash of the int32 tensor bytes.  The hash is stable across device
+# (we move to CPU once), preserves per-sample order, and survives
+# reordering (each sample is hashed independently — we can then check
+# any permutation via the multiset of hashes).
+#
+# We also expose a monotonically increasing trace-id that the actor
+# increments every time it sets ``engine._r3_pending_routed_experts``
+# so each end-to-end replay can be correlated across STAGE2 → STAGE3 →
+# STAGE4 log lines.
+# ===================================================================
+
+
+# Global monotonically increasing trace-id.  Incremented at the side-channel
+# SET site (actor._compute_logp / actor._ppo_update).  Read back at the
+# CONSUMPTION site in ``_r3_forward_backward_batch``.  Exported via an
+# env-independent module-level function so *all* stages print the same id.
+_R3_TRACE_ID: int = 0
+
+
+def _r3_next_trace_id() -> int:
+    """Reserve & return a new trace-id.
+
+    A trace-id identifies one SIDE_CHANNEL-SET -> CONSUME -> REPLAY cycle.
+    """
+    global _R3_TRACE_ID
+    _R3_TRACE_ID += 1
+    return _R3_TRACE_ID
+
+
+def _r3_current_trace_id() -> int:
+    return _R3_TRACE_ID
+
+
+def _r3_hash64(t) -> int:
+    """Return a stable 64-bit hash of a tensor/ndarray's int32 bytes.
+
+    For a ``(bs, seqlen, L, K)`` routed_experts tensor this is cheap
+    (one CPU copy) and deterministic regardless of dtype conversion.
+    Returns 0 for ``None``.
+    """
+    if t is None:
+        return 0
+    try:
+        if isinstance(t, torch.Tensor):
+            tc = t.detach()
+            if tc.device.type != "cpu":
+                tc = tc.to("cpu", non_blocking=False)
+            arr = tc.to(torch.int32).contiguous().numpy()
+        else:
+            import numpy as np
+
+            arr = (t if isinstance(t, np.ndarray) else np.asarray(t)).astype("int32", copy=False)
+        import hashlib
+
+        return int.from_bytes(
+            hashlib.blake2b(arr.tobytes(), digest_size=8).digest(),
+            "big",
+            signed=False,
+        )
+    except Exception:
+        return -1
+
+
+def _r3_per_sample_hashes(t, max_rows: int = 64) -> list[int]:
+    """Return per-sample 64-bit hashes.
+
+    For a 4D ``(bs, seqlen, L, K)`` tensor, returns one hash per sample
+    (dim-0).  For 3D packed ``(total_aligned, L, K)`` returns one hash
+    per row (capped at ``max_rows`` to keep log size sane).
+    """
+    if t is None:
+        return []
+    try:
+        if isinstance(t, torch.Tensor):
+            tc = t.detach()
+            if tc.device.type != "cpu":
+                tc = tc.to("cpu", non_blocking=False)
+            arr = tc.to(torch.int32).contiguous().numpy()
+        else:
+            import numpy as np
+
+            arr = (t if isinstance(t, np.ndarray) else np.asarray(t)).astype("int32", copy=False)
+        import hashlib
+
+        out = []
+        for i in range(min(arr.shape[0], max_rows)):
+            b = arr[i].tobytes()
+            out.append(
+                int.from_bytes(
+                    hashlib.blake2b(b, digest_size=8).digest()[:4],
+                    "big",
+                    signed=False,
+                )
+            )
+        return out
+    except Exception:
+        return [-1]
+
+
+def _r3_per_sample_nnz(t, max_rows: int = 64) -> list[int]:
+    """Return per-sample non-zero counts (rows where any expert id != 0)."""
+    if t is None:
+        return []
+    try:
+        if isinstance(t, torch.Tensor):
+            tc = t.detach()
+            if tc.device.type != "cpu":
+                tc = tc.to("cpu", non_blocking=False)
+            arr = tc.to(torch.int32).contiguous().numpy()
+        else:
+            import numpy as np
+
+            arr = (t if isinstance(t, np.ndarray) else np.asarray(t)).astype("int32", copy=False)
+        out = []
+        for i in range(min(arr.shape[0], max_rows)):
+            out.append(int((arr[i] != 0).any(axis=-1).sum()))
+        return out
+    except Exception:
+        return [-1]
+
+
+def _r3_per_sample_seq_real_len(t, max_rows: int = 64) -> list[int]:
+    """Return per-sample "real-looking" length = index of last non-all-zero row + 1.
+
+    Useful for verifying that the routed_experts tensor is right-padded
+    as expected: the real length should equal the sample's attention
+    mask sum (= cu_seqlens diff).  If it doesn't, alignment is off.
+    """
+    if t is None:
+        return []
+    try:
+        if isinstance(t, torch.Tensor):
+            tc = t.detach()
+            if tc.device.type != "cpu":
+                tc = tc.to("cpu", non_blocking=False)
+            arr = tc.to(torch.int32).contiguous().numpy()
+        else:
+            import numpy as np
+
+            arr = (t if isinstance(t, np.ndarray) else np.asarray(t)).astype("int32", copy=False)
+        out = []
+        for i in range(min(arr.shape[0], max_rows)):
+            row_any = (arr[i] != 0).any(axis=(-1, -2)) if arr[i].ndim >= 2 else (arr[i] != 0)
+            nz = row_any.nonzero()[0]
+            out.append(int(nz[-1]) + 1 if len(nz) else 0)
+        return out
+    except Exception:
+        return [-1]
+
+
+# ===================================================================
 # Layer computation helpers
 # ===================================================================
 
@@ -441,12 +597,13 @@ def set_router_replay_data(
 
         if _r3_verbose() and _r3_should_log("set_router_replay_data/ENTER"):
             logger.info(
-                "[R3-STAGE3/set_router_replay_data] ENTER call#%d %s "
+                "[R3-STAGE3/set_router_replay_data] ENTER call#%d trace_id=%d %s "
                 "layers_topk_idx=(bs=%d, max_seq=%d, L=%d, K=%d) dtype=%s "
                 "n_cu_entries=%d n_seqs_in_cu=%d seq_align_to=%d "
-                "seq_lens[:8]=%s aligned_lens[:8]=%s total_aligned=%d "
+                "seq_lens[:16]=%s aligned_lens[:16]=%s total_aligned=%d "
                 "vp_rank=%s | %s",
                 _r3_call_count("set_router_replay_data/ENTER"),
+                _r3_current_trace_id(),
                 _r3_pp_tp_info(tf_config, vp_rank),
                 bs_re,
                 layers_topk_idx.shape[1],
@@ -456,12 +613,37 @@ def set_router_replay_data(
                 n_cu_entries,
                 n_seqs_in_cu,
                 seq_align_to,
-                seq_lens[:8],
-                aligned_lens[:8],
+                seq_lens[:16],
+                aligned_lens[:16],
                 total_aligned,
                 vp_rank,
                 _r3_tensor_sig("cu_seqlens", cu_seqlens),
             )
+        # Per-sample fingerprint (hash, nnz, real_len) so we can verify
+        # the SAME bytes reach here as the actor pushed into the
+        # side-channel.  Any mismatch between hashes implies a
+        # split/reorder bug somewhere upstream.
+        if _r3_verbose() and _r3_should_log("set_router_replay_data/PER_SAMPLE"):
+            try:
+                _h = _r3_per_sample_hashes(layers_topk_idx, max_rows=32)
+                _nnz = _r3_per_sample_nnz(layers_topk_idx, max_rows=32)
+                _rl = _r3_per_sample_seq_real_len(layers_topk_idx, max_rows=32)
+                logger.info(
+                    "[R3-STAGE3/set_router_replay_data] PER_SAMPLE trace_id=%d %s "
+                    "bs_re=%d n_seqs_in_cu=%d "
+                    "per_sample_hash[:16]=%s per_sample_nnz_rows[:16]=%s "
+                    "per_sample_real_len[:16]=%s cu_seqlens_diff[:16]=%s",
+                    _r3_current_trace_id(),
+                    _r3_pp_tp_info(tf_config, vp_rank),
+                    bs_re,
+                    n_seqs_in_cu,
+                    [hex(h) for h in _h[:16]],
+                    _nnz[:16],
+                    _rl[:16],
+                    seq_lens[:16],
+                )
+            except Exception as e:
+                logger.warning("[R3-STAGE3/set_router_replay_data] PER_SAMPLE err=%s", e)
 
         # Pack routed_experts using cu_seqlens-aligned layout.
         # layers_topk_idx is left-ALIGNED: real tokens at positions [0, seq_len).
@@ -549,10 +731,32 @@ def set_router_replay_data(
                 zrows = int(row_all_zero.sum().item())
                 total_rows = int(row_all_zero.numel())
                 n_valid = int(valid_mask.sum().item())
+                # Per-sample valid-row count (after strike), lined up with
+                # aligned_lens so any off-by-one immediately surfaces.
+                per_sample_valid_after = []
+                per_sample_valid_before = []
+                _off = 0
+                for _i in range(n_seqs_in_cu):
+                    _al = aligned_lens[_i] if _i < len(aligned_lens) else 0
+                    _seg = valid_mask[_off : _off + _al]
+                    _segz = row_all_zero[_off : _off + _al]
+                    per_sample_valid_after.append(int(_seg.sum().item()))
+                    per_sample_valid_before.append(
+                        int((~_segz[: seq_lens[_i] if _i < len(seq_lens) else 0]).sum().item())
+                        if _i < len(seq_lens)
+                        else 0
+                    )
+                    _off += _al
             logger.info(
-                "[R3-STAGE3/set_router_replay_data] PACKED "
+                "[R3-STAGE3/set_router_replay_data] PACKED trace_id=%d %s "
                 "packed=(total_aligned=%d, L=%d, K=%d) global_zero_rows=%d/%d "
-                "(%.2f%%) valid_rows=%d/%d (%.2f%%) struck_tail_rows=%d | %s",
+                "(%.2f%%) valid_rows=%d/%d (%.2f%%) struck_tail_rows=%d "
+                "per_sample_valid_before_strike[:16]=%s "
+                "per_sample_valid_after_strike[:16]=%s "
+                "per_sample_real_len[:16]=%s aligned_lens[:16]=%s "
+                "packed_hash=%s | %s",
+                _r3_current_trace_id(),
+                _r3_pp_tp_info(tf_config, vp_rank),
                 packed.shape[0],
                 packed.shape[1],
                 packed.shape[2],
@@ -563,6 +767,11 @@ def set_router_replay_data(
                 total_rows,
                 100.0 * n_valid / max(total_rows, 1),
                 n_strike,
+                per_sample_valid_before[:16],
+                per_sample_valid_after[:16],
+                seq_lens[:16],
+                aligned_lens[:16],
+                hex(_r3_hash64(packed)),
                 _r3_tensor_sig("packed", packed),
             )
 
@@ -592,13 +801,18 @@ def set_router_replay_data(
             with torch.no_grad():
                 n_local_valid = int(local_mask.sum().item())
             logger.info(
-                "[R3-STAGE3/set_router_replay_data] POST-SCATTER "
-                "tp_size=%d local_valid=%d/%d local_tokens=%s layers_topk=%s",
+                "[R3-STAGE3/set_router_replay_data] POST-SCATTER trace_id=%d %s "
+                "tp_size=%d local_valid=%d/%d local_tokens=%s layers_topk=%s "
+                "local_tokens_hash=%s local_mask_hash=%s",
+                _r3_current_trace_id(),
+                _r3_pp_tp_info(tf_config, vp_rank),
                 tp_size,
                 n_local_valid,
                 local_mask.numel(),
                 _r3_tensor_sig("local_tokens", local_tokens),
                 _r3_tensor_sig("layers_topk", layers_topk),
+                hex(_r3_hash64(local_tokens)),
+                hex(_r3_hash64(local_mask.to(torch.int32))),
             )
 
         # Step 4: Distribute to RouterReplay instances for local PP layers
@@ -655,6 +869,7 @@ def set_router_replay_data(
                         idx,
                         _r3_zero_row_stats(slab),
                         _r3_tensor_sig(f"target[L={layer_idx}]", slab),
+                        hex(_r3_hash64(slab)),
                     )
                 )
             router_offset += 1
@@ -675,15 +890,16 @@ def set_router_replay_data(
             # the rest summarised.
             head = dispatched[:_R3_ROUTER_LAYER_LIMIT]
             logger.info(
-                "[R3-STAGE3/set_router_replay_data] DISPATCH %s "
+                "[R3-STAGE3/set_router_replay_data] DISPATCH trace_id=%d %s "
                 "router_offset=%d len(router_list)=%d index_by_layer=%s "
                 "first_layers=%s ... (total dispatched=%d)",
+                _r3_current_trace_id(),
                 _r3_pp_tp_info(tf_config, vp_rank),
                 router_offset,
                 len(router_list),
                 index_by_layer,
                 [
-                    (lidx, j, zr, sig) for lidx, j, zr, sig in head
+                    (lidx, j, zr, sig, h) for lidx, j, zr, sig, h in head
                 ],
                 len(dispatched),
             )

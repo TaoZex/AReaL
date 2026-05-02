@@ -295,6 +295,10 @@ def _split_routed_experts_for_mbs(
     )
     try:
         from areal.engine.router_replay_utils import (
+            _r3_hash64,
+            _r3_per_sample_hashes,
+            _r3_per_sample_nnz,
+            _r3_per_sample_seq_real_len,
             _r3_pp_tp_info,
             _r3_should_log,
             _r3_tensor_sig,
@@ -302,20 +306,41 @@ def _split_routed_experts_for_mbs(
         )
 
         if _r3_verbose() and _r3_should_log("_split_routed_experts_for_mbs"):
+            pre_hash = _r3_per_sample_hashes(routed_experts, max_rows=32)
+            post_hash = _r3_per_sample_hashes(reordered, max_rows=32)
+            per_mb_hashes = [
+                [hex(h) for h in _r3_per_sample_hashes(r, max_rows=16)]
+                for r in result
+            ]
+            per_mb_nnz = [_r3_per_sample_nnz(r, max_rows=16) for r in result]
+            per_mb_real = [_r3_per_sample_seq_real_len(r, max_rows=16) for r in result]
             logger.info(
                 "[R3-STAGE3/_split_routed_experts_for_mbs] %s "
-                "input_shape=%s n_mbs=%d forward_indices=%s "
-                "per_mb_shapes=%s | %s",
+                "input_shape=%s input_hash=%s n_mbs=%d "
+                "forward_indices=%s per_mb_shapes=%s per_mb_hashes=%s "
+                "pre_reorder_per_sample_hash[:16]=%s "
+                "post_reorder_per_sample_hash[:16]=%s "
+                "per_mb_per_sample_hash=%s per_mb_per_sample_nnz=%s "
+                "per_mb_per_sample_real_len=%s | %s",
                 _r3_pp_tp_info(),
                 tuple(routed_experts.shape),
+                hex(_r3_hash64(routed_experts)),
                 n_mbs,
                 "None" if forward_indices is None
-                else f"len={len(forward_indices)} first16={forward_indices[:16].tolist() if hasattr(forward_indices,'tolist') else list(forward_indices)[:16]}",
+                else f"len={len(forward_indices)} first32={forward_indices[:32].tolist() if hasattr(forward_indices,'tolist') else list(forward_indices)[:32]}",
                 [tuple(r.shape) for r in result],
+                [hex(_r3_hash64(r)) for r in result],
+                [hex(h) for h in pre_hash[:16]],
+                [hex(h) for h in post_hash[:16]],
+                per_mb_hashes,
+                per_mb_nnz,
+                per_mb_real,
                 _r3_tensor_sig("routed_experts", routed_experts, max_sample=4),
             )
     except Exception:
-        pass
+        logger.exception(
+            "[R3-STAGE3/_split_routed_experts_for_mbs] trace log failed"
+        )
     return result
 
 
@@ -409,12 +434,43 @@ def _r3_forward_backward_batch(
     # ------------------------------------------------------------------
     routed_experts_batch = None
     _from_side_channel = False
+    _consumed_trace_id = getattr(self, "_r3_active_trace_id", None)
 
     # Strategy A: Side-channel (preferred path)
     if hasattr(self, '_r3_pending_routed_experts') and self._r3_pending_routed_experts is not None:
         routed_experts_batch = self._r3_pending_routed_experts
         self._r3_pending_routed_experts = None  # Consume it
         _from_side_channel = True
+        try:
+            from areal.engine.router_replay_utils import (
+                _r3_hash64,
+                _r3_per_sample_hashes,
+                _r3_per_sample_nnz,
+                _r3_per_sample_seq_real_len,
+                _r3_pp_tp_info,
+                _r3_verbose,
+            )
+            if _r3_verbose():
+                logger.info(
+                    "[R3-STAGE3/_r3_forward_backward_batch] "
+                    "SIDE_CHANNEL_CONSUME trace_id=%s %s forward_only=%s "
+                    "shape=%s hash=%s per_sample_hash[:16]=%s "
+                    "per_sample_nnz[:16]=%s per_sample_real_len[:16]=%s",
+                    _consumed_trace_id,
+                    _r3_pp_tp_info(),
+                    forward_only,
+                    routed_experts_batch.shape,
+                    hex(_r3_hash64(routed_experts_batch)),
+                    [hex(h) for h in _r3_per_sample_hashes(
+                        routed_experts_batch, max_rows=16)],
+                    _r3_per_sample_nnz(routed_experts_batch, max_rows=16),
+                    _r3_per_sample_seq_real_len(routed_experts_batch, max_rows=16),
+                )
+        except Exception:
+            logger.exception(
+                "[R3-STAGE3/_r3_forward_backward_batch] "
+                "SIDE_CHANNEL_CONSUME trace log failed"
+            )
         logger.debug(
             "[R3] Retrieved routed_experts from engine side-channel: shape=%s.",
             routed_experts_batch.shape,
@@ -594,14 +650,35 @@ def _r3_forward_backward_batch(
                         if _r3_verbose() and _r3_should_log(
                             "_R3MicroBatchIterator.pre_align"
                         ):
+                            from areal.engine.router_replay_utils import (
+                                _r3_hash64,
+                                _r3_per_sample_hashes,
+                                _r3_per_sample_nnz,
+                                _r3_per_sample_seq_real_len,
+                                _r3_current_trace_id,
+                            )
                             logger.info(
                                 "[R3-STAGE3/_R3MicroBatchIterator] PRE-ALIGN "
-                                "mb_idx=%d %s orig_cu_src=%s max_seqlen=%d "
+                                "mb_idx=%d trace_id=%d %s orig_cu_src=%s "
+                                "max_seqlen=%d re_shape=%s re_hash=%s "
+                                "per_sample_hash[:16]=%s per_sample_nnz[:16]=%s "
+                                "per_sample_real_len[:16]=%s "
+                                "orig_cu_diff[:16]=%s padded_cu_diff[:16]=%s "
                                 "| %s | %s | %s",
                                 idx,
+                                _r3_current_trace_id(),
                                 _r3_pp_tp_info(),
                                 orig_cu_src,
                                 max_seqlen,
+                                tuple(re.shape),
+                                hex(_r3_hash64(re)),
+                                [hex(h) for h in _r3_per_sample_hashes(re, max_rows=16)],
+                                _r3_per_sample_nnz(re, max_rows=16),
+                                _r3_per_sample_seq_real_len(re, max_rows=16),
+                                (orig_cu[1:] - orig_cu[:-1]).long().cpu().tolist()[:16]
+                                if hasattr(orig_cu, "cpu") else "N/A",
+                                (cu_seqlens[1:] - cu_seqlens[:-1]).long().cpu().tolist()[:16]
+                                if hasattr(cu_seqlens, "cpu") else "N/A",
                                 _r3_tensor_sig("re", re, max_sample=4),
                                 _r3_tensor_sig("orig_cu", orig_cu),
                                 _r3_tensor_sig("padded_cu", cu_seqlens),

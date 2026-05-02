@@ -187,25 +187,38 @@ class RouterReplay:
         # increment.
         try:
             from areal.engine.router_replay_utils import (
+                _r3_current_trace_id,
+                _r3_hash64,
                 _r3_pp_tp_info,
                 _r3_should_log,
                 _r3_tensor_sig,
+                _r3_verbose,
                 _r3_zero_row_stats,
             )
 
-            if _r3_should_log("RouterReplay.set_target_indices"):
+            if _r3_verbose() and _r3_should_log("RouterReplay.set_target_indices"):
                 # instance index in the class-level list tells us which
                 # MoE layer this replay slot refers to
                 try:
                     inst_idx = RouterReplay.router_instances.index(self)
                 except ValueError:
                     inst_idx = -1
+                _slab_hash = hex(_r3_hash64(topk_indices))
+                _mask_hash = (
+                    hex(_r3_hash64(valid_mask.to(torch.int32)))
+                    if valid_mask is not None else "None"
+                )
                 logger.info(
-                    "[R3-STAGE3b/set_target_indices] inst#%d %s %s | %s | "
-                    "backward_queue_len=%d",
+                    "[R3-STAGE3b/set_target_indices] trace_id=%d inst#%d %s %s "
+                    "slab_shape=%s slab_hash=%s mask_hash=%s "
+                    "| %s | backward_queue_len=%d (post-push)",
+                    _r3_current_trace_id(),
                     inst_idx,
                     _r3_pp_tp_info(),
                     _r3_zero_row_stats(topk_indices),
+                    tuple(topk_indices.shape),
+                    _slab_hash,
+                    _mask_hash,
                     _r3_tensor_sig("topk_indices", topk_indices),
                     len(self.replay_backward_list),
                 )
@@ -369,8 +382,36 @@ def _patched_topk_routing_with_score_function(
             top_indices = top_indices.to(scores.device)
             # splice padded rows with the LIVE router top-k so
             # that TP-alignment / batch padding slack (which was recorded as
-            # all-zeros) does not force those rows to expert 0. 
+            # all-zeros) does not force those rows to expert 0.
             valid_mask = getattr(router_replay, "target_valid_mask", None)
+            try:
+                from areal.engine.router_replay_utils import (
+                    _r3_current_trace_id as _tid,
+                    _r3_hash64 as _h64,
+                    _r3_should_log as _sl,
+                    _r3_verbose as _v,
+                )
+                if _v() and _sl("REPLAY_FORWARD/consume"):
+                    try:
+                        _inst_idx = RouterReplay.router_instances.index(router_replay)
+                    except ValueError:
+                        _inst_idx = -1
+                    logger.info(
+                        "[R3-STAGE4/REPLAY_FORWARD/consume] trace_id=%d inst#%d "
+                        "scores_shape=%s target_shape=%s shape_match=%s "
+                        "target_hash=%s mask_hash=%s backward_queue_len=%d",
+                        _tid(),
+                        _inst_idx,
+                        tuple(scores.shape),
+                        tuple(top_indices.shape),
+                        top_indices.shape[0] == scores.shape[0],
+                        hex(_h64(top_indices)),
+                        "None" if valid_mask is None
+                        else hex(_h64(valid_mask.to(torch.int32))),
+                        len(router_replay.replay_backward_list),
+                    )
+            except Exception:
+                pass
             if valid_mask is not None and valid_mask.shape[0] == top_indices.shape[0]:
                 _, live_top = _compute_topk(
                     scores, topk, num_groups=num_groups, group_topk=group_topk
@@ -402,6 +443,10 @@ def _patched_topk_routing_with_score_function(
                 )
                 return _compute_topk(scores, topk, num_groups=num_groups, group_topk=group_topk)
             # Use the last recorded indices for backward replay
+            _bw_queue_len_before = len(router_replay.replay_backward_list)
+            _bw_mask_queue_len_before = len(
+                getattr(router_replay, "replay_backward_mask_list", []) or []
+            )
             top_indices = router_replay.replay_backward_list.pop(0)
             top_indices = top_indices.to(scores.device)
             # pop the matching per-row validity mask (if any)
@@ -414,6 +459,79 @@ def _patched_topk_routing_with_score_function(
                 bw_valid_mask = bw_mask_list.pop(0)
             else:
                 bw_valid_mask = None
+            # ---- R3 deep-trace: log backward pop order + hashes ----
+            try:
+                from areal.engine.router_replay_utils import (
+                    _r3_current_trace_id as _tid,
+                    _r3_hash64 as _h64,
+                    _r3_should_log as _sl,
+                    _r3_verbose as _v,
+                )
+
+                if _v() and _sl("REPLAY_BACKWARD/consume"):
+                    try:
+                        _inst_idx = RouterReplay.router_instances.index(router_replay)
+                    except ValueError:
+                        _inst_idx = -1
+                    _popped_slab_hash = hex(_h64(top_indices))
+                    _popped_mask_hash = (
+                        "None"
+                        if bw_valid_mask is None
+                        else hex(_h64(bw_valid_mask.to(torch.int32)))
+                    )
+                    _target_hash = (
+                        "None"
+                        if router_replay.target_topk_idx is None
+                        else hex(_h64(router_replay.target_topk_idx))
+                    )
+                    _divergence = (
+                        "None"
+                        if router_replay.target_topk_idx is None
+                        else (
+                            "MATCH"
+                            if (
+                                router_replay.target_topk_idx.shape
+                                == top_indices.shape
+                                and hex(
+                                    _h64(
+                                        router_replay.target_topk_idx.to(
+                                            top_indices.device
+                                        )
+                                    )
+                                )
+                                == _popped_slab_hash
+                            )
+                            else "DIVERGE_vs_FWD_TARGET"
+                        )
+                    )
+                    logger.info(
+                        "[R3-STAGE4/REPLAY_BACKWARD/consume] trace_id=%d inst#%d "
+                        "scores_shape=%s popped_shape=%s shape_match_scores=%s "
+                        "popped_slab_hash=%s popped_mask_hash=%s "
+                        "current_target_hash=%s divergence=%s "
+                        "queue_len_before=%d queue_len_after=%d "
+                        "mask_queue_len_before=%d mask_queue_len_after=%d",
+                        _tid(),
+                        _inst_idx,
+                        tuple(scores.shape),
+                        tuple(top_indices.shape),
+                        top_indices.shape[0] == scores.shape[0],
+                        _popped_slab_hash,
+                        _popped_mask_hash,
+                        _target_hash,
+                        _divergence,
+                        _bw_queue_len_before,
+                        len(router_replay.replay_backward_list),
+                        _bw_mask_queue_len_before,
+                        len(
+                            getattr(router_replay, "replay_backward_mask_list", [])
+                            or []
+                        ),
+                    )
+            except Exception:
+                logger.exception(
+                    "[R3-STAGE4/REPLAY_BACKWARD/consume] trace log failed"
+                )
             if (
                 bw_valid_mask is not None
                 and bw_valid_mask.shape[0] == top_indices.shape[0]
