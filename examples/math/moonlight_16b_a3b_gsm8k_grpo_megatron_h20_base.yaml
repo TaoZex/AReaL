@@ -21,7 +21,7 @@ rollout:
   backend: "sglang:d1p1t2"
   experiment_name: ${experiment_name}
   trial_name: ${trial_name}
-  max_concurrent_rollouts: 64
+  max_concurrent_rollouts: 16
   queue_size: null
   consumer_batch_size: ${train_dataset.batch_size}
   max_head_offpolicyness: 0
