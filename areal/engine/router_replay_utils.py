@@ -1048,8 +1048,38 @@ def preprocess_routed_experts_batch(
     # Build (1, seq_len, num_moe_layers, topk) with RIGHT padding.
     real_tokens = int(attention_mask.sum().item())
     padded = torch.zeros(1, seq_len, num_moe_layers, topk, dtype=torch.int32)
-    n = min(num_sgl_tokens, real_tokens)
-    padded[0, :n] = tensor[:n]
+    if num_sgl_tokens > real_tokens:
+        # Pathological case (~2.4% of samples in observed runs):
+        # SGLang returned routing for MORE tokens than the final request
+        # actually carries (e.g. KV-preempt + retry, multi-turn rollout,
+        # or an abandoned prefill prefix whose routing was not dropped).
+        # Taking the HEAD ``tensor[:real_tokens]`` here would bind this
+        # sample to UNRELATED tokens' expert decisions and cause
+        # catastrophic router-replay misalignment: per-sample k3_kl jumps
+        # from ~1e-4 (normal) to ~1.0, producing the "~40% normal + ~60%
+        # broken" bimodal rollout-vs-train logp divergence.
+        #
+        # Safe behavior: disable R3 for THIS sample by leaving ``padded``
+        # as all-zeros. The training-side replay path treats all-zero
+        # rows as "no recorded routing" and falls back to the live router
+        # (see ``valid_mask`` splicing in ``router_replay_patch.py``),
+        # which makes this sample behave like an R3-off sample instead
+        # of a corrupted one.
+        logger.warning(
+            "[R3] preprocess_routed_experts_batch: num_sgl_tokens=%d > "
+            "real_tokens=%d (ratio=%.2f, seq_len=%d). This is the "
+            "'double-rollout' / preempt-retry path; taking tensor[:real] "
+            "here would MIS-ALIGN routing to unrelated tokens. Disabling "
+            "R3 for this sample (returning all-zero routed_experts so "
+            "replay falls back to live routing).",
+            num_sgl_tokens,
+            real_tokens,
+            num_sgl_tokens / max(real_tokens, 1),
+            seq_len,
+        )
+    else:
+        n = min(num_sgl_tokens, real_tokens)
+        padded[0, :n] = tensor[:n]
 
     if compress_dtype:
         max_val = padded.max().item()
