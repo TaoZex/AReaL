@@ -115,10 +115,28 @@ class SGLangBackend:
         if spec_accept_token_num is not None and spec_draft_token_num is not None:
             if spec_draft_token_num > 0:
                 accept_rate = spec_accept_token_num / spec_draft_token_num
-                logger.debug(
-                    f"[SpecDec] SGLang response: accept={spec_accept_token_num}, "
-                    f"draft={spec_draft_token_num}, rate={accept_rate:.4f}"
+                import os as _os_d03
+                _d03_to_debug = (
+                    _os_d03.environ.get(
+                        "AREAL_SPECDEC_D03_DEBUG", "0") == "1"
                 )
+                if _d03_to_debug:
+                    logger.debug(
+                        f"[SpecDecDiag-v20 D03] SGLang response: "
+                        f"accept={spec_accept_token_num}, "
+                        f"draft={spec_draft_token_num}, "
+                        f"rate={accept_rate:.4f}"
+                    )
+                else:
+                    logger.info(
+                        f"[SpecDecDiag-v20 D03] SGLang response: "
+                        f"accept={spec_accept_token_num}, "
+                        f"draft={spec_draft_token_num}, "
+                        f"rate={accept_rate:.4f} "
+                        f"prompt_tokens={meta_info.get('prompt_tokens', 'n/a')} "
+                        f"completion_tokens="
+                        f"{meta_info.get('completion_tokens', 'n/a')}"
+                    )
         if stop_reason == "abort" and stop_message.startswith("Abort before prefill"):
             return HttpGenerationResult(
                 output_tokens=[],

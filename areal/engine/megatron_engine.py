@@ -201,6 +201,7 @@ class MegatronEngine(TrainEngine):
                     "v16:MTPSerializeFp32Upcast(AREAL_MTP_FP32_BROADCAST)",
                     "v17:MTPNativeAutoScaler+ConsumerBypass"
                     "(AREAL_MTP_NATIVE_AUTOSCALER,autograd_in_graph)",
+                    "v20:SpecDecDiag(D01-D14 full pipeline instrumentation)",
                 ]
                 _banner_flags = {
                     "AREAL_MTP_FP32_BROADCAST":
@@ -214,6 +215,60 @@ class MegatronEngine(TrainEngine):
                     "[MTPVersionBanner] tags=%s flags=%s",
                     ",".join(_banner_tags), _banner_flags,
                 )
+                try:
+                    import torch as _t_d01
+                    _dtype_d01 = str(getattr(self, "dtype", "n/a"))
+                    _opt_cfg = getattr(self, "optimizer_config", None)
+                    _mc_cfg = getattr(self, "mcore_config", None)
+                    self.logger.info(
+                        "[SpecDecDiag-v20 D01] EngineInit: "
+                        "mtp_num_layers=%s mtp_loss_scaling_factor=%s "
+                        "mtp_detach_heads=%s enable_mtp_training=%s "
+                        "dtype=%s torch_version=%s",
+                        getattr(self, "mtp_num_layers", None),
+                        getattr(self, "mtp_loss_scaling_factor", None),
+                        getattr(self, "mtp_detach_heads", None),
+                        getattr(self, "enable_mtp_training", None),
+                        _dtype_d01, _t_d01.__version__,
+                    )
+                    if _opt_cfg is not None:
+                        self.logger.info(
+                            "[SpecDecDiag-v20 D01] EngineInit optimizer_cfg: "
+                            "type=%s lr=%s weight_decay=%s beta1=%s beta2=%s "
+                            "eps=%s mtp_lr_scale=%s gradient_clipping=%s "
+                            "lr_scheduler_type=%s",
+                            getattr(_opt_cfg, "type", None),
+                            getattr(_opt_cfg, "lr", None),
+                            getattr(_opt_cfg, "weight_decay", None),
+                            getattr(_opt_cfg, "beta1", None),
+                            getattr(_opt_cfg, "beta2", None),
+                            getattr(_opt_cfg, "eps", None),
+                            getattr(_opt_cfg, "mtp_lr_scale", None),
+                            getattr(_opt_cfg, "gradient_clipping", None),
+                            getattr(_opt_cfg, "lr_scheduler_type", None),
+                        )
+                    if _mc_cfg is not None:
+                        self.logger.info(
+                            "[SpecDecDiag-v20 D01] EngineInit mcore_cfg: "
+                            "use_precision_aware_optimizer=%s "
+                            "exp_avg_dtype=%s exp_avg_sq_dtype=%s "
+                            "use_distributed_optimizer=%s "
+                            "overlap_param_gather_with_optimizer_step=%s",
+                            getattr(_mc_cfg,
+                                    "use_precision_aware_optimizer", None),
+                            getattr(_mc_cfg, "exp_avg_dtype", None),
+                            getattr(_mc_cfg, "exp_avg_sq_dtype", None),
+                            getattr(_mc_cfg,
+                                    "use_distributed_optimizer", None),
+                            getattr(_mc_cfg,
+                                    "overlap_param_gather_with_optimizer_step",
+                                    None),
+                        )
+                except Exception as _e_d01:
+                    self.logger.warning(
+                        "[SpecDecDiag-v20 D01] static dump failed: %s",
+                        _e_d01,
+                    )
             except Exception:
                 pass
             self.logger.info(
@@ -1011,6 +1066,51 @@ class MegatronEngine(TrainEngine):
                                     "[MTPGradDiag] Per-MTP-param gradient norms:\n"
                                     + "\n".join(mtp_param_details)
                                 )
+                            try:
+                                _d09_step = getattr(self, "_global_step", 0)
+                                if _d09_step <= 5 or _d09_step % 20 == 0:
+                                    _d09_rows = []
+                                    import torch as _t_d09
+                                    for _m in self.model:
+                                        for _n, _p in _m.named_parameters():
+                                            if ".mtp." not in _n:
+                                                continue
+                                            _g = (_p.main_grad
+                                                  if hasattr(_p, "main_grad")
+                                                  and _p.main_grad is not None
+                                                  else _p.grad)
+                                            if _g is None:
+                                                continue
+                                            _gf = _g.data.float()
+                                            _pf = _p.data.float()
+                                            _d09_rows.append(
+                                                "%s: dtype=%s |W|_max=%.3e "
+                                                "|W|_mean=%.3e "
+                                                "|g|_max=%.3e |g|_mean=%.3e "
+                                                "g.sum=%.3e g.finite=%s" % (
+                                                    _n, str(_p.dtype),
+                                                    _pf.abs().max().item(),
+                                                    _pf.abs().mean().item(),
+                                                    _gf.abs().max().item(),
+                                                    _gf.abs().mean().item(),
+                                                    _gf.sum().item(),
+                                                    bool(_t_d09.isfinite(_gf)
+                                                         .all().item()),
+                                                )
+                                            )
+                                    if _d09_rows:
+                                        self.logger.info(
+                                            "[SpecDecDiag-v20 D09] step=%d "
+                                            "per-MTP-param grad+weight "
+                                            "snapshot:\n%s",
+                                            _d09_step,
+                                            "\n".join(_d09_rows),
+                                        )
+                            except Exception as _e_d09:
+                                self.logger.warning(
+                                    "[SpecDecDiag-v20 D09] failed: %s",
+                                    _e_d09,
+                                )
                             # Additional diagnostic: check if any MTP param
                             # has .grad (not main_grad) with nonzero value,
                             # which would indicate gradient accumulation fusion
@@ -1092,8 +1192,86 @@ class MegatronEngine(TrainEngine):
         return mtp_stats
 
     def optimizer_step(self):
+        # [SpecDecDiag-v20 D10] pre-step MTP weight snapshot.
+        _d10_pre = {}
+        try:
+            _d10_step = int(getattr(self, "_global_step", 0) or 0)
+            _d10_sample = (_d10_step <= 20) or (_d10_step % 10 == 0)
+            if (self.enable_mtp_training and _d10_sample
+                    and getattr(self, "model", None) is not None):
+                for _mod in self.model:
+                    for _n, _p in _mod.named_parameters():
+                        if ".mtp." not in _n:
+                            continue
+                        try:
+                            _d10_pre[_n] = _p.detach().clone()
+                        except Exception:
+                            pass
+        except Exception as _e_d10:
+            self.logger.warning(
+                "[SpecDecDiag-v20 D10] snapshot failed: %s", _e_d10,
+            )
+
         with trace_scope("megatron_engine.step"):
             update_successful, grad_norm, _ = self.optimizer.step()
+
+        # [SpecDecDiag-v20 D11] post-step |deltaW| per MTP tensor.
+        try:
+            import torch as _t_d11
+            if _d10_pre:
+                _step_d11 = int(getattr(self, "_global_step", 0) or 0)
+                _rows = []
+                _floor_est = 7.78e-3
+                _n_total = 0
+                _n_stalled = 0
+                _max_delta_global = 0.0
+                for _mod in self.model:
+                    for _n, _p in _mod.named_parameters():
+                        if _n not in _d10_pre:
+                            continue
+                        _pre = _d10_pre[_n]
+                        try:
+                            _delta = (_p.detach() - _pre).float().abs()
+                            _max = float(_delta.max().item())
+                            _mean = float(_delta.mean().item())
+                            _norm = float(_delta.norm().item())
+                            _w_abs_max = float(_p.detach().float()
+                                              .abs().max().item())
+                            _n_total += 1
+                            _stalled = _max == 0.0
+                            if _stalled:
+                                _n_stalled += 1
+                            if _max > _max_delta_global:
+                                _max_delta_global = _max
+                            if len(_rows) < 8 or _stalled:
+                                _rows.append(
+                                    "%s: |dW|_max=%.3e mean=%.3e "
+                                    "norm=%.3e |W|_max=%.3e %s" % (
+                                        _n, _max, _mean, _norm,
+                                        _w_abs_max,
+                                        "STALLED" if _stalled else "",
+                                    )
+                                )
+                        except Exception:
+                            pass
+                self.logger.info(
+                    "[SpecDecDiag-v20 D11] PostOpt step=%d "
+                    "total=%d stalled=%d max|dW|_global=%.3e "
+                    "bf16_ulp_floor_est=%.3e",
+                    _step_d11, _n_total, _n_stalled,
+                    _max_delta_global, _floor_est,
+                )
+                if _rows:
+                    self.logger.info(
+                        "[SpecDecDiag-v20 D11] per-tensor (step=%d):\n%s",
+                        _step_d11, "\n".join(_rows),
+                    )
+                _d10_pre.clear()
+        except Exception as _e_d11:
+            self.logger.warning(
+                "[SpecDecDiag-v20 D11] compare failed: %s", _e_d11,
+            )
+
         current_lr = self.optimizer.param_groups[0]["lr"]
 
         # Log MTP lr if using separate param group
@@ -1448,6 +1626,56 @@ class MegatronEngine(TrainEngine):
                                         mtp_labels, mtp_logits
                                     )
                                     mtp_loss = loss_mask * mtp_loss
+                                    try:
+                                        _d05_step = getattr(
+                                            _engine_ref, "_global_step", 0)
+                                        _d05_mb = _mtp_diag_mb_counter[0]
+                                        _d05_gate = (_d05_mb == 0 and
+                                                     (_d05_step <= 5
+                                                      or _d05_step % 50 == 0))
+                                        if _d05_gate:
+                                            import torch as _t_d05
+                                            _hs_f = hidden_states.detach().float()
+                                            _lm_f = loss_mask.detach().float()
+                                            _logger.info(
+                                                "[SpecDecDiag-v20 D05] "
+                                                "MTPLayer#%d step=%d "
+                                                "hidden_states: shape=%s "
+                                                "dtype=%s rg=%s "
+                                                "abs_mean=%.3e abs_max=%.3e "
+                                                "finite=%s",
+                                                mtp_layer_number, _d05_step,
+                                                list(hidden_states.shape),
+                                                str(hidden_states.dtype),
+                                                hidden_states.requires_grad,
+                                                _hs_f.abs().mean().item(),
+                                                _hs_f.abs().max().item(),
+                                                bool(_t_d05.isfinite(_hs_f)
+                                                     .all().item()),
+                                            )
+                                            _logger.info(
+                                                "[SpecDecDiag-v20 D05] "
+                                                "MTPLayer#%d step=%d "
+                                                "loss_mask: shape=%s "
+                                                "num_tokens=%s sum=%.1f "
+                                                "mtp_loss_raw: abs_mean=%.3e "
+                                                "abs_max=%.3e sum=%.6f",
+                                                mtp_layer_number, _d05_step,
+                                                list(loss_mask.shape),
+                                                num_tokens,
+                                                _lm_f.sum().item(),
+                                                mtp_loss.detach().float()
+                                                    .abs().mean().item(),
+                                                mtp_loss.detach().float()
+                                                    .abs().max().item(),
+                                                mtp_loss.detach().float()
+                                                    .sum().item(),
+                                            )
+                                    except Exception as _e_d05:
+                                        _logger.warning(
+                                            "[SpecDecDiag-v20 D05] failed: %s",
+                                            _e_d05,
+                                        )
                                     # [v5-F1c] Gate MB#0 mtp_loss diag to first 3 steps + every 100.
                                     _gs_ml = getattr(_engine_ref, '_global_step', 0)
                                     if (_mtp_diag_mb_counter[0] == 0
@@ -1538,12 +1766,90 @@ class MegatronEngine(TrainEngine):
                                                     1.0 / float(_num_mb_v17)
                                                 )
                                             )
+                                            try:
+                                                _d06_step = getattr(
+                                                    _engine_ref,
+                                                    "_global_step", 0)
+                                                if (_mtp_diag_mb_counter[0] == 0
+                                                        and (_d06_step <= 5
+                                                        or _d06_step % 50 == 0)):
+                                                    _logger.info(
+                                                        "[SpecDecDiag-v20 "
+                                                        "D06] "
+                                                        "step=%d mtp_layer=%d "
+                                                        "mtp_loss_scale=%.6e "
+                                                        "calculate_per_token_"
+                                                        "loss=%s "
+                                                        "num_tokens=%s "
+                                                        "num_mb=%d "
+                                                        "mtp_loss_to_store:"
+                                                        " shape=%s rg=%s "
+                                                        "sum=%.6e abs_max=%.3e",
+                                                        _d06_step,
+                                                        mtp_layer_number,
+                                                        float(mtp_loss_scale),
+                                                        self_model.config
+                                                            .calculate_per_token_loss,
+                                                        num_tokens,
+                                                        _num_mb_v17,
+                                                        list(_mtp_loss_to_store
+                                                             .shape),
+                                                        _mtp_loss_to_store
+                                                            .requires_grad,
+                                                        _mtp_loss_to_store
+                                                            .detach().float()
+                                                            .sum().item(),
+                                                        _mtp_loss_to_store
+                                                            .detach().float()
+                                                            .abs().max().item(),
+                                                    )
+                                            except Exception as _e_d06:
+                                                _logger.warning(
+                                                    "[SpecDecDiag-v20 D06] "
+                                                    "failed: %s", _e_d06,
+                                                )
                                             hidden_states = (
                                                 _MTPLossAutoScaler_v17.apply(
                                                     hidden_states,
                                                     _mtp_loss_to_store,
                                                 )
                                             )
+                                            try:
+                                                _d07_bs = (
+                                                    _MTPLossAutoScaler_v17
+                                                    .main_loss_backward_scale
+                                                )
+                                                _d07_bs_v = (
+                                                    float(_d07_bs.item())
+                                                    if hasattr(_d07_bs, "item")
+                                                    else float(_d07_bs)
+                                                )
+                                                if (_mtp_diag_mb_counter[0] == 0
+                                                        and (_d06_step <= 5
+                                                        or _d06_step % 50
+                                                        == 0)):
+                                                    _logger.info(
+                                                        "[SpecDecDiag-v20 "
+                                                        "D07] step=%d "
+                                                        "mtp_layer=%d "
+                                                        "post-apply "
+                                                        "main_loss_backward_"
+                                                        "scale=%.6e "
+                                                        "hs.grad_fn=%s",
+                                                        _d06_step,
+                                                        mtp_layer_number,
+                                                        _d07_bs_v,
+                                                        type(hidden_states
+                                                             .grad_fn).__name__
+                                                        if hidden_states
+                                                            .grad_fn
+                                                        else "None",
+                                                    )
+                                            except Exception as _e_d07:
+                                                _logger.warning(
+                                                    "[SpecDecDiag-v20 D07] "
+                                                    "failed: %s", _e_d07,
+                                                )
                                             _engine_ref._v17_native_active = True
                                             if _mtp_diag_mb_counter[0] == 0:
                                                 _logger.info(
@@ -1600,14 +1906,30 @@ class MegatronEngine(TrainEngine):
                                         and hidden_states.requires_grad
                                         and _should_log_bwd):
                                     def _mtp_backward_hook(grad, _lg=_logger, _gs=_gs_v5):
-                                        # Inner hook fires once per backward; log only on gated steps.
+                                        import torch as _t_d08
+                                        _g_f = grad.float()
                                         _lg.info(
                                             "[MTPBwdDiag] AutoScaler backward FIRED (step=%d): "
                                             "grad.shape=%s, grad.norm=%.8f, "
                                             "grad.abs_max=%.8f",
                                             _gs, list(grad.shape),
-                                            grad.float().norm().item(),
-                                            grad.float().abs().max().item())
+                                            _g_f.norm().item(),
+                                            _g_f.abs().max().item())
+                                        _lg.info(
+                                            "[SpecDecDiag-v20 D08] "
+                                            "hs-bwd step=%d grad.abs_mean=%.3e "
+                                            "grad.mean=%.3e grad.std=%.3e "
+                                            "grad.nonzero_frac=%.3f "
+                                            "grad.finite=%s dtype=%s",
+                                            _gs,
+                                            _g_f.abs().mean().item(),
+                                            _g_f.mean().item(),
+                                            _g_f.std().item(),
+                                            (_g_f != 0).float().mean().item(),
+                                            bool(_t_d08.isfinite(_g_f)
+                                                 .all().item()),
+                                            str(grad.dtype),
+                                        )
                                     hidden_states.register_hook(_mtp_backward_hook)
                                     _logger.info(
                                         "[MTPFwdDiag] MB#0 Registered backward hook on "
@@ -2051,6 +2373,36 @@ class MegatronEngine(TrainEngine):
         if not hasattr(self, '_global_step'):
             self._global_step = 0
         self._global_step += 1
+
+        # [SpecDecDiag-v20 D04] per-step summary before fwd/bwd.
+        try:
+            _d04_nmb = int(self._current_num_microbatches)
+            _d04_ntok = int(getattr(self, "_current_n_tokens", 0) or 0)
+            _d04_pgs = getattr(self.optimizer, "param_groups", []) or []
+            _d04_base_lr = float(_d04_pgs[0].get("lr", 0.0)) if _d04_pgs else 0.0
+            _d04_base_max = float(_d04_pgs[0].get("max_lr", 0.0)) if _d04_pgs else 0.0
+            _d04_mtp_lr = None
+            if self.enable_mtp_training and len(_d04_pgs) > 1:
+                for _pg in _d04_pgs:
+                    if (_pg.get("max_lr", None) is not None
+                            and abs(float(_pg.get("max_lr"))
+                                    - _d04_base_max) > 1e-12):
+                        _d04_mtp_lr = float(_pg.get("lr", 0.0))
+                        break
+            self.logger.info(
+                "[SpecDecDiag-v20 D04] TrainStepEnter step=%d num_mb=%d "
+                "n_tokens=%d base_lr=%.3e base_max_lr=%.3e "
+                "mtp_lr=%s n_param_groups=%d loss_multiplier=%.3e",
+                self._global_step, _d04_nmb, _d04_ntok,
+                _d04_base_lr, _d04_base_max,
+                ("%.3e" % _d04_mtp_lr) if _d04_mtp_lr is not None else "base",
+                len(_d04_pgs), float(loss_multiplier),
+            )
+        except Exception as _e_d04:
+            self.logger.warning(
+                "[SpecDecDiag-v20 D04] TrainStepEnter log failed: %s",
+                _e_d04,
+            )
 
         self.forward_backward_batch(mb_list, process_output, forward_only=False)
         DeviceRuntimeInfo.get_current().log("train_batch after forward_backward")
@@ -3187,14 +3539,31 @@ class MegatronEngine(TrainEngine):
                     if _v16_on:
                         import torch as _torch_v16
                         _upcasted = 0
+                        _d12_sample = None
                         for _i in range(_prev_count, len(mtp_hf_tensors)):
                             _nm_v16, _tn_v16 = mtp_hf_tensors[_i]
+                            if _d12_sample is None:
+                                try:
+                                    _d12_sample = (
+                                        _nm_v16, str(_tn_v16.dtype),
+                                        float(_tn_v16.float().abs()
+                                              .max().item()),
+                                    )
+                                except Exception:
+                                    _d12_sample = (_nm_v16, "n/a", 0.0)
                             if _tn_v16.dtype == _torch_v16.bfloat16:
                                 mtp_hf_tensors[_i] = (
                                     _nm_v16,
                                     _tn_v16.float().contiguous(),
                                 )
                                 _upcasted += 1
+                        if _d12_sample is not None:
+                            self.logger.info(
+                                "[SpecDecDiag-v20 D12] pre-upcast-sample "
+                                "hf=%s dtype=%s |W|_max=%.3e upcasted=%d",
+                                _d12_sample[0], _d12_sample[1],
+                                _d12_sample[2], _upcasted,
+                            )
                         if _upcasted > 0:
                             self.logger.info(
                                 "[MTPBf16UpcastBroadcast-v16] Upcast %d MTP "
