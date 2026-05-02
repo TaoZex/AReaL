@@ -206,6 +206,7 @@ class MegatronEngine(TrainEngine):
                     "(AREAL_MTP_FP32_MASTER_READ,AREAL_MTP_FP32_BROADCAST=1)",
                     "v22:CollectiveDeadlockFix+PreScan+EarlyFlush",
                     "v23:NoDPCollective+TPConsensus+MainParamViewDirect",
+                    "v24:TPDtypeSymmetric+NonPPHeadAlsoFp32",
                 ]
                 _banner_flags = {
                     "AREAL_MTP_FP32_BROADCAST":
@@ -3651,7 +3652,7 @@ class MegatronEngine(TrainEngine):
             if ".mtp." in name:
                 mtp_param_count += 1
                 mtp_param_bytes += param.numel() * param.element_size()
-                # NoDPCollective path.
+                # [MTPFp32MasterRead-v24]  TPDtypeSymmetric path.
                 # Root cause of the iter10 hang: v22 issued a DP
                 # all_gather_into_tensor under `if _have_master`
                 # which is True only on the DP rank that *owns*
@@ -3668,11 +3669,21 @@ class MegatronEngine(TrainEngine):
                 # owning DP rank share the same ownership status.
                 # A TP-group MIN all_reduce on the have_master
                 # bool provides a belt-and-braces sanity check.
-                import os as _os_v23m
-                import sys as _sys_v23m
-                import torch as _torch_v23m
+                #
+                # v24 change: ALL ranks (pp-head or not) call
+                # _collect_param with the SAME source tensor
+                # (fp32_full or bf16 param) so the TP
+                # all_gather_param inside _collect_param sees a
+                # consistent dtype across TP peers. v23 had a
+                # subtle bug: pp-head passed fp32 while non-pp
+                # passed bf16 -> dtype mismatch inside
+                # all_gather_param -> silent data corruption or
+                # NCCL dtype error.
+                import os as _os_v24m
+                import sys as _sys_v24m
+                import torch as _torch_v24m
                 _mp_on = (
-                    _os_v23m.environ.get(
+                    _os_v24m.environ.get(
                         "AREAL_MTP_FP32_MASTER_READ", "1",
                     ) == "1"
                 )
@@ -3682,8 +3693,8 @@ class MegatronEngine(TrainEngine):
                     try:
                         _mp_shard = getattr(param, "main_param", None)
                         _have_master_local = (
-                            isinstance(_mp_shard, _torch_v23m.Tensor)
-                            and _mp_shard.dtype == _torch_v23m.float32
+                            isinstance(_mp_shard, _torch_v24m.Tensor)
+                            and _mp_shard.dtype == _torch_v24m.float32
                             and int(_mp_shard.numel())
                             == int(param.numel())
                         )
@@ -3694,7 +3705,7 @@ class MegatronEngine(TrainEngine):
                             )
                         except TypeError:
                             _dp_group = mpu.get_data_parallel_group()
-                        _dp_ws = _torch_v23m.distributed.get_world_size(
+                        _dp_ws = _torch_v24m.distributed.get_world_size(
                             group=_dp_group,
                         )
                         try:
@@ -3702,12 +3713,12 @@ class MegatronEngine(TrainEngine):
                         except Exception:
                             _tp_group = None
                         _tp_ws = (
-                            _torch_v23m.distributed.get_world_size(
+                            _torch_v24m.distributed.get_world_size(
                                 group=_tp_group)
                             if _tp_group is not None else 1
                         )
                         self.logger.info(
-                            "[MTPFp32MasterRead-v23 ENTER] rank=%d "
+                            "[MTPFp32MasterRead-v24 ENTER] rank=%d "
                             "name=%s dp_ws=%d tp_ws=%d "
                             "have_master_local=%s shard_numel=%s "
                             "need_numel=%d",
@@ -3715,7 +3726,7 @@ class MegatronEngine(TrainEngine):
                             str(_have_master_local),
                             (str(int(_mp_shard.numel()))
                                 if isinstance(
-                                    _mp_shard, _torch_v23m.Tensor)
+                                    _mp_shard, _torch_v24m.Tensor)
                                 else "n/a"),
                             int(param.numel()),
                         )
@@ -3725,7 +3736,7 @@ class MegatronEngine(TrainEngine):
                                     _h.flush()
                                 except Exception:
                                     pass
-                            _sys_v23m.stdout.flush()
+                            _sys_v24m.stdout.flush()
                         except Exception:
                             pass
                         # TP-group MIN all_reduce on have_master bool.
@@ -3737,18 +3748,18 @@ class MegatronEngine(TrainEngine):
                             _dev = (
                                 _mp_shard.device
                                 if isinstance(
-                                    _mp_shard, _torch_v23m.Tensor)
+                                    _mp_shard, _torch_v24m.Tensor)
                                 else param.device
                             )
-                            _hv = _torch_v23m.tensor(
+                            _hv = _torch_v24m.tensor(
                                 [1 if _have_master_local else 0],
-                                dtype=_torch_v23m.int32,
+                                dtype=_torch_v24m.int32,
                                 device=_dev,
                             )
-                            _torch_v23m.distributed.all_reduce(
+                            _torch_v24m.distributed.all_reduce(
                                 _hv,
                                 op=(
-                                    _torch_v23m.distributed
+                                    _torch_v24m.distributed
                                     .ReduceOp.MIN
                                 ),
                                 group=_tp_group,
@@ -3756,7 +3767,7 @@ class MegatronEngine(TrainEngine):
                             _have_master_tp = bool(int(_hv.item()) == 1)
                             if _have_master_tp != _have_master_local:
                                 self.logger.warning(
-                                    "[MTPFp32MasterRead-v23 "
+                                    "[MTPFp32MasterRead-v24 "
                                     "TP_CONSENSUS] rank=%d name=%s "
                                     "local=%s consensus=%s; "
                                     "falling back to bf16 on this "
@@ -3768,7 +3779,7 @@ class MegatronEngine(TrainEngine):
                                 )
                             else:
                                 self.logger.info(
-                                    "[MTPFp32MasterRead-v23 "
+                                    "[MTPFp32MasterRead-v24 "
                                     "TP_CONSENSUS] rank=%d name=%s "
                                     "consensus=%s",
                                     dist.get_rank(), name,
@@ -3801,7 +3812,7 @@ class MegatronEngine(TrainEngine):
                                 False,
                             ):
                                 self.logger.warning(
-                                    "[MTPFp32MasterRead-v23] "
+                                    "[MTPFp32MasterRead-v24] "
                                     "param.main_param unavailable on "
                                     "this TP-group (rank=%d, "
                                     "name=%s, kind=%s); using bf16 "
@@ -3812,7 +3823,7 @@ class MegatronEngine(TrainEngine):
                                 self._mtp_master_read_missing_warned = True
                         if _fp32_full is not None:
                             self.logger.info(
-                                "[MTPFp32MasterRead-v23 D15a] "
+                                "[MTPFp32MasterRead-v24 D15a] "
                                 "rank=%d name=%s dp_ws=%d tp_ws=%d "
                                 "shape=%s fp32_abs_mean=%.6e "
                                 "fp32_abs_max=%.6e (source=%s)",
@@ -3828,27 +3839,27 @@ class MegatronEngine(TrainEngine):
                                     _h.flush()
                                 except Exception:
                                     pass
-                            _sys_v23m.stdout.flush()
+                            _sys_v24m.stdout.flush()
                         except Exception:
                             pass
-                    except Exception as _e_v23m:
+                    except Exception as _e_v24m:
                         self.logger.warning(
-                            "[MTPFp32MasterRead-v23] error "
+                            "[MTPFp32MasterRead-v24] error "
                             "name=%s: %s; falling back to bf16.",
-                            name, _e_v23m,
+                            name, _e_v24m,
                         )
                         _fp32_full = None
                         _src_tag = "bf16model"
-                # Feed _collect_param: pp-head uses the gathered
-                # tensors for serialize; non-pp peers drive it too
-                # so TP all_gather_param stays symmetric.
+                # v24: ALL ranks call _collect_param with the SAME
+                # source tensor (fp32_full or bf16 param) so the TP
+                # all_gather_param inside sees consistent dtype.
+                if _fp32_full is not None:
+                    _mtp_param, _ = self._collect_param(
+                        name, _fp32_full,
+                    )
+                else:
+                    _mtp_param, _ = self._collect_param(name, param)
                 if _collect_mtp_for_draft:
-                    if _fp32_full is not None:
-                        _mtp_param, _ = self._collect_param(
-                            name, _fp32_full,
-                        )
-                    else:
-                        _mtp_param, _ = self._collect_param(name, param)
                     _mtp_model_name = self.hf_config.model_type
                     _prev_count = len(mtp_hf_tensors)
                     mtp_hf_tensors.extend(
@@ -3861,12 +3872,12 @@ class MegatronEngine(TrainEngine):
                             fp8_direct_convert=self.fp8_direct_convert,
                         )
                     )
-                    # [MTPBf16UpcastBroadcast-v23] Upcast bf16->fp32
+                    # [MTPBf16UpcastBroadcast-v24] Upcast bf16->fp32
                     # before serialize so sub-ULP deltas are not
                     # rounded on the wire (default 1).
                     try:
                         _v16_on = (
-                            _os_v23m.environ.get(
+                            _os_v24m.environ.get(
                                 "AREAL_MTP_FP32_BROADCAST", "1",
                             ) == "1"
                         )
@@ -3876,7 +3887,7 @@ class MegatronEngine(TrainEngine):
                         _upcasted = 0
                         for _i in range(_prev_count, len(mtp_hf_tensors)):
                             _nm_v16, _tn_v16 = mtp_hf_tensors[_i]
-                            if _tn_v16.dtype == _torch_v23m.bfloat16:
+                            if _tn_v16.dtype == _torch_v24m.bfloat16:
                                 mtp_hf_tensors[_i] = (
                                     _nm_v16,
                                     _tn_v16.float().contiguous(),
@@ -3884,7 +3895,7 @@ class MegatronEngine(TrainEngine):
                                 _upcasted += 1
                         if _upcasted > 0:
                             self.logger.info(
-                                "[MTPBf16UpcastBroadcast-v23] Upcast %d "
+                                "[MTPBf16UpcastBroadcast-v24] Upcast %d "
                                 "MTP tensors bf16->fp32 (name=%s).",
                                 _upcasted, name,
                             )
@@ -3926,7 +3937,7 @@ class MegatronEngine(TrainEngine):
                                     _h.flush()
                                 except Exception:
                                     pass
-                            _sys_v23m.stdout.flush()
+                            _sys_v24m.stdout.flush()
                         except Exception:
                             pass
                     # Per-tensor stats.
@@ -3954,10 +3965,6 @@ class MegatronEngine(TrainEngine):
                             f"abs_max={_abs.max().item():.6e}, "
                             f"norm={_hf_tensor.float().norm().item():.6e}"
                         )
-                else:
-                    # non-pp-head rank still drives TP all_gather for
-                    # symmetry.
-                    self._collect_param(name, param)
                 continue
             if self.config.use_lora and (
                 ".adapter." not in name or not getattr(param, "requires_grad", False)
