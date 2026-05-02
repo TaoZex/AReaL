@@ -202,14 +202,19 @@ class MegatronEngine(TrainEngine):
                     "v17:MTPNativeAutoScaler+ConsumerBypass"
                     "(AREAL_MTP_NATIVE_AUTOSCALER,autograd_in_graph)",
                     "v20:SpecDecDiag(D01-D14 full pipeline instrumentation)",
+                    "v21:MTPFp32MasterRead+DefaultsOn"
+                    "(AREAL_MTP_FP32_MASTER_READ,AREAL_MTP_FP32_BROADCAST=1)",
                 ]
                 _banner_flags = {
                     "AREAL_MTP_FP32_BROADCAST":
                         _os_banner.environ.get(
-                            "AREAL_MTP_FP32_BROADCAST", "0"),
+                            "AREAL_MTP_FP32_BROADCAST", "1"),
                     "AREAL_MTP_NATIVE_AUTOSCALER":
                         _os_banner.environ.get(
                             "AREAL_MTP_NATIVE_AUTOSCALER", "0"),
+                    "AREAL_MTP_FP32_MASTER_READ":
+                        _os_banner.environ.get(
+                            "AREAL_MTP_FP32_MASTER_READ", "1"),
                 }
                 self.logger.info(
                     "[MTPVersionBanner] tags=%s flags=%s",
@@ -3506,7 +3511,125 @@ class MegatronEngine(TrainEngine):
                 mtp_param_count += 1
                 mtp_param_bytes += param.numel() * param.element_size()
                 if _collect_mtp_for_draft:
-                    _mtp_param, _ = self._collect_param(name, param)
+                    # [MTPFp32MasterRead-v21] Root-cause fix for accept-rate
+                    # decay: DistributedOptimizer.step() casts fp32 master
+                    # params (main_param) to bf16 model params via
+                    # _copy_main_params_to_model_params.
+                    import os as _os_v21
+                    import torch as _torch_v21
+                    _master_read_on = (
+                        _os_v21.environ.get(
+                            "AREAL_MTP_FP32_MASTER_READ", "1",
+                        ) == "1"
+                    )
+                    _fp32_full = None
+                    if _master_read_on:
+                        try:
+                            _mp_shard = getattr(param, "main_param", None)
+                            if (
+                                _mp_shard is not None
+                                and isinstance(_mp_shard, _torch_v21.Tensor)
+                                and _mp_shard.dtype == _torch_v21.float32
+                            ):
+                                try:
+                                    _dp_group = mpu.get_data_parallel_group(
+                                        with_context_parallel=True,
+                                    )
+                                except TypeError:
+                                    _dp_group = (
+                                        mpu.get_data_parallel_group()
+                                    )
+                                _dp_ws = _torch_v21.distributed.get_world_size(
+                                    group=_dp_group,
+                                )
+                                if _dp_ws > 1:
+                                    _flat = _torch_v21.empty(
+                                        _mp_shard.numel() * _dp_ws,
+                                        dtype=_torch_v21.float32,
+                                        device=_mp_shard.device,
+                                    )
+                                    _torch_v21.distributed.all_gather_into_tensor(
+                                        _flat,
+                                        _mp_shard.contiguous(),
+                                        group=_dp_group,
+                                    )
+                                else:
+                                    _flat = _mp_shard.contiguous()
+                                # main_param shard is a flat view into the
+                                # DP-sharded param buffer. DP all-gather
+                                # produces the full flattened param; then
+                                # slice+reshape to the model param shape.
+                                _need = int(param.numel())
+                                if _flat.numel() >= _need:
+                                    _fp32_full = (
+                                        _flat[:_need]
+                                        .view(param.shape)
+                                        .contiguous()
+                                    )
+                                    # preserve TP sharding attributes so
+                                    # all_gather_param() treats this tensor
+                                    # the same as the bf16 model param.
+                                    if hasattr(param, "tensor_model_parallel"):
+                                        _fp32_full.tensor_model_parallel = (
+                                            param.tensor_model_parallel
+                                        )
+                                    if hasattr(param, "partition_dim"):
+                                        _fp32_full.partition_dim = (
+                                            param.partition_dim
+                                        )
+                                    if hasattr(param, "partition_stride"):
+                                        _fp32_full.partition_stride = (
+                                            param.partition_stride
+                                        )
+                                    self.logger.info(
+                                        "[MTPFp32MasterRead-v21 D15a] "
+                                        "name=%s dp_ws=%d fp32_full.shape=%s "
+                                        "fp32_abs_mean=%.6e fp32_abs_max=%.6e "
+                                        "(source=main_param)",
+                                        name, _dp_ws,
+                                        tuple(_fp32_full.shape),
+                                        float(_fp32_full.abs().mean().item()),
+                                        float(_fp32_full.abs().max().item()),
+                                    )
+                                else:
+                                    self.logger.warning(
+                                        "[MTPFp32MasterRead-v21] size "
+                                        "mismatch name=%s flat=%d need=%d; "
+                                        "falling back to bf16.",
+                                        name, int(_flat.numel()), _need,
+                                    )
+                            else:
+                                if not getattr(
+                                    self, "_mtp_master_read_missing_warned",
+                                    False,
+                                ):
+                                    self.logger.warning(
+                                        "[MTPFp32MasterRead-v21] "
+                                        "param.main_param unavailable for "
+                                        "name=%s (shard=%s); falling back "
+                                        "to bf16 model param. This will "
+                                        "re-expose the bf16-ULP flooring "
+                                        "root cause; ensure "
+                                        "DistributedOptimizer is used.",
+                                        name,
+                                        type(_mp_shard).__name__,
+                                    )
+                                    self._mtp_master_read_missing_warned = (
+                                        True
+                                    )
+                        except Exception as _e_v21:
+                            self.logger.warning(
+                                "[MTPFp32MasterRead-v21] error for "
+                                "name=%s: %s; falling back to bf16.",
+                                name, _e_v21,
+                            )
+                            _fp32_full = None
+                    if _fp32_full is not None:
+                        _mtp_param, _ = self._collect_param(
+                            name, _fp32_full,
+                        )
+                    else:
+                        _mtp_param, _ = self._collect_param(name, param)
                     _mtp_model_name = self.hf_config.model_type
                     _prev_count = len(mtp_hf_tensors)
                     mtp_hf_tensors.extend(
@@ -3519,23 +3642,23 @@ class MegatronEngine(TrainEngine):
                             fp8_direct_convert=self.fp8_direct_convert,
                         )
                     )
-                    #  Upcast MTP-draft
+                    # [MTPBf16UpcastBroadcast-v16] Upcast MTP-draft
                     # tensors to fp32 before serialization/broadcast so
                     # sub-bf16-ULP weight deltas are not rounded away
                     # on the wire. Complements upstream's NCCL-path
                     # [MTPBroadcastDtype] upcast (which only covers
                     # the distributed-weight-update path, not the
                     # MTPSerialize/update_weights_from_tensor path).
-                    # Gated on AREAL_MTP_FP32_BROADCAST=1.
+                    # v21: default flipped 0->1.
                     try:
                         import os as _os_v16
                         _v16_on = (
                             _os_v16.environ.get(
-                                "AREAL_MTP_FP32_BROADCAST", "0",
+                                "AREAL_MTP_FP32_BROADCAST", "1",
                             ) == "1"
                         )
                     except Exception:
-                        _v16_on = False
+                        _v16_on = True
                     if _v16_on:
                         import torch as _torch_v16
                         _upcasted = 0
@@ -3571,6 +3694,35 @@ class MegatronEngine(TrainEngine):
                                 "(name=%s).",
                                 _upcasted, name,
                             )
+                    # [MTPWeightDeltaD15] Inter-version abs_mean delta
+                    # tracker: proves the fp32-master-read fix works by
+                    # showing non-zero abs_mean delta each version. Before
+                    # the fix, abs_mean was frozen across 62 versions. A
+                    # delta magnitude > 1e-7 confirms SGLang sees an
+                    # actually-updated draft head.
+                    if not hasattr(self, "_mtp_d15_prev_abs_mean"):
+                        self._mtp_d15_prev_abs_mean = {}
+                    for _hf_nm_d15, _hf_tn_d15 in mtp_hf_tensors[_prev_count:]:
+                        _am_d15 = float(
+                            _hf_tn_d15.float().abs().mean().item(),
+                        )
+                        _prev_am = self._mtp_d15_prev_abs_mean.get(_hf_nm_d15)
+                        if _prev_am is None:
+                            _dlt = None
+                        else:
+                            _dlt = _am_d15 - _prev_am
+                        self._mtp_d15_prev_abs_mean[_hf_nm_d15] = _am_d15
+                        self.logger.info(
+                            "[MTPWeightDeltaD15] hf=%s abs_mean=%.9e "
+                            "delta=%s frozen=%s (dtype=%s src=%s)",
+                            _hf_nm_d15, _am_d15,
+                            ("%+0.3e" % _dlt) if _dlt is not None else "n/a",
+                            ("True" if _dlt is not None
+                                and abs(_dlt) < 1e-9 else "False"),
+                            str(_hf_tn_d15.dtype),
+                            "fp32master" if _fp32_full is not None
+                                else "bf16model",
+                        )
                     # Diagnostic: log each converted MTP tensor with value
                     # statistics for post-mortem debugging of weight corruption.
                     for _hf_name, _hf_tensor in mtp_hf_tensors[_prev_count:]:
