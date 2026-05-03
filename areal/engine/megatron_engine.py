@@ -199,35 +199,27 @@ class MegatronEngine(TrainEngine):
                     "v12:OptimDump+Sanity",
                     "v14:LRScaleGuard+WeightDeltaGuard",
                     "v16:MTPSerializeFp32Upcast(AREAL_MTP_FP32_BROADCAST)",
+                    "v28:MTPSigmaDeltaBf16(AREAL_MTP_SIGMA_DELTA_BF16)",
+                    "v33:Bf16PayloadNorm+DeterministicProbe(AREAL_MTP_V30_DIAG)",
                     "v17:MTPNativeAutoScaler+ConsumerBypass"
                     "(AREAL_MTP_NATIVE_AUTOSCALER,autograd_in_graph)",
-                    "v21:MTPFp32MasterRead+DefaultsOn"
-                    "(AREAL_MTP_FP32_MASTER_READ,AREAL_MTP_FP32_BROADCAST=1)",
-                    "v22:CollectiveDeadlockFix+PreScan+EarlyFlush",
-                    "v23:NoDPCollective+TPConsensus+MainParamViewDirect",
-                    "v24:TPDtypeSymmetric+NonPPHeadAlsoFp32",
-                    "v25:AcceptEMA+GradProbe+PostOptim+Bf16Drift+SendPreBcast",
-                    "v32:AuditLatch+ReadBackEndpoint(AREAL_MTP_V30_DIAG)",
                 ]
                 _banner_flags = {
                     "AREAL_MTP_FP32_BROADCAST":
                         _os_banner.environ.get(
                             "AREAL_MTP_FP32_BROADCAST", "1"),
+                    "AREAL_MTP_SIGMA_DELTA_BF16":
+                        _os_banner.environ.get(
+                            "AREAL_MTP_SIGMA_DELTA_BF16", "1"),
                     "AREAL_MTP_NATIVE_AUTOSCALER":
                         _os_banner.environ.get(
                             "AREAL_MTP_NATIVE_AUTOSCALER", "0"),
-                    "AREAL_MTP_FP32_MASTER_READ":
-                        _os_banner.environ.get(
-                            "AREAL_MTP_FP32_MASTER_READ", "1"),
                     "AREAL_MTP_V30_DIAG":
                         _os_banner.environ.get(
                             "AREAL_MTP_V30_DIAG", "1"),
                 }
-                # [MTPVersionBanner-v29] Added iter16 instrumentation: SGLangReadBackMTPv3-v28(CallbackPath) / MTPBf16ULPProof-v28.
-                _banner_tags = list(_banner_tags) + ["v27:SGLangReadBackMTPv2-HTTP+MainGrad+Fp32Delta", "v28:SGLangReadBackMTPv3-CallbackPath+MTPBf16ULPProof",
-                    "v29:SigmaDeltaBf16(AREAL_MTP_SIGMA_DELTA_BF16)+SglangGetAddrsFix"]
                 self.logger.info(
-                    "[MTPVersionBanner-v29] tags=%s flags=%s",
+                    "[MTPVersionBanner] tags=%s flags=%s",
                     ",".join(_banner_tags), _banner_flags,
                 )
                 try:
@@ -4246,30 +4238,57 @@ class MegatronEngine(TrainEngine):
                                 "MTP tensors bf16->fp32 (name=%s).",
                                 _upcasted, name,
                             )
-                    # [MTPSigmaDeltaBf16-v29] Residual-carried bf16
-                    # quantization of the fp32 MTP payload. This is
-                    # the iter17 functional fix that addresses the
-                    # bf16-ULP flooring 100% confirmed from log.10:
-                    #   - LayerNorm weights frozen across consecutive
-                    #     MTP sync events (MTPBf16ULPProof-v28 showed
-                    #     bf16cast_eq_prev_bf16cast==numel on final/
-                    #     input/hidden/post_attention/token_layernorm)
-                    #   - fp32 master delta per step ~2e-6 (log.10
-                    #     MTPFp32Delta-v27), well below bf16 ULP at
-                    #     |w|=3 (~1.56e-2), so SGLang's bf16 draft
-                    #     weight never moves for these tensors.
-                    # We carry each step's round-off residual into
-                    # the next sync event so cumulative sub-ULP
-                    # deltas eventually "tick" the bf16 weight one
-                    # ULP at a time -- classic Sigma-Delta / noise-
-                    # shaped quantization. This turns the SGLang-
-                    # side bf16 target dtype from a hard floor into
-                    # a dithered representation of the fp32 master
-                    # without introducing per-element ULP jitter
-                    # (pure stochastic rounding would do that).
+                    # [MTPSigmaDeltaBf16-v28] Residual-carried bf16
+                    # quantization of the fp32 MTP payload.
+                    #
+                    # PURPOSE
+                    #   After v16 upcast the MTP payload is fp32. But
+                    #   SGLang 0.5.9's draft model storage is bf16
+                    #   (no fp32-draft knob exists) and its
+                    #   default_weight_loader does
+                    #   `param.data.copy_(loaded_weight)` which rounds
+                    #   fp32->bf16 RNE at the destination.  When the
+                    #   per-step fp32 delta is smaller than half a
+                    #   bf16 ULP (e.g. 2e-6 vs 1.56e-2 for |w|=3 on
+                    #   LayerNorm) the draft weight is frozen across
+                    #   thousands of steps and accept rate stalls.
+                    #   (Confirmed from MTPBf16ULPProof diag in
+                    #   iter14-17: bf16cast_eq_prev_bf16cast == numel
+                    #   for 5/5 consecutive syncs on all LayerNorm
+                    #   MTP params.)
+                    #
+                    # FIX
+                    #   Per-tensor residual r[name] (fp32) accumulates
+                    #   round-off; each sync we send
+                    #     bf16 = RNE(fp32 + r_prev)
+                    #     r_new = (fp32 + r_prev) - bf16
+                    #   Cumulative sub-ULP deltas eventually cross the
+                    #   bf16 ULP and "tick" the draft weight one ULP
+                    #   at a time (classic Sigma-Delta quantization).
+                    #   Unlike per-element stochastic rounding this
+                    #   is deterministic and preserves monotonic
+                    #   sub-ULP trajectories.
+                    #
+                    # NOTES
+                    #   * slime/verl do not address this. Research of
+                    #     https://github.com/THUDM/slime ,
+                    #     https://github.com/volcengine/verl , SGLang
+                    #     v0.5.9 and Megatron-LM core_r0.16.0 confirms
+                    #     they all ship bf16 round-to-nearest. See
+                    #     megatron distrib_optimizer.py
+                    #     _copy_main_params_to_model_params (plain
+                    #     copy_) and sglang weight_utils.py
+                    #     default_weight_loader (plain copy_).
+                    #   * Only bf16 storage on SGLang side is affected.
+                    #     If AREAL_MTP_FP32_BROADCAST=0 or upstream
+                    #     already materialised fp32, we are a no-op.
+                    #   * Only MTP-draft tensors go through this
+                    #     block; all other params are untouched.
+                    #
+                    # Gate: AREAL_MTP_SIGMA_DELTA_BF16 (default "1").
                     try:
                         _sd_on = (
-                            _os_v24m.environ.get(
+                            _os_v16.environ.get(
                                 "AREAL_MTP_SIGMA_DELTA_BF16", "1",
                             ) == "1"
                         )
@@ -4278,59 +4297,100 @@ class MegatronEngine(TrainEngine):
                     if _sd_on:
                         if not hasattr(self, "_mtp_sd_residual"):
                             self._mtp_sd_residual = {}
+                        if not hasattr(self, "_mtp_sd_sync_idx"):
+                            self._mtp_sd_sync_idx = {}
                         _sd_applied = 0
-                        _sd_nonzero_shift = 0
+                        _sd_total_shifted = 0
+                        _sd_sample_details = []
                         for _i in range(_prev_count, len(mtp_hf_tensors)):
                             _nm_sd, _tn_sd = mtp_hf_tensors[_i]
-                            # Only apply to fp32 tensors (the upcast
-                            # step above may have produced fp32; if
-                            # still bf16 here, nothing to do).
-                            if _tn_sd.dtype != _torch_v24m.float32:
+                            # Only fp32 MTP payload is candidate.
+                            if _tn_sd.dtype != _torch_v16.float32:
                                 continue
-                            _prev_res = self._mtp_sd_residual.get(
-                                _nm_sd
-                            )
+                            _r_prev = self._mtp_sd_residual.get(_nm_sd)
                             if (
-                                _prev_res is not None
-                                and _prev_res.shape == _tn_sd.shape
-                                and _prev_res.device == _tn_sd.device
+                                _r_prev is not None
+                                and _r_prev.shape == _tn_sd.shape
+                                and _r_prev.device == _tn_sd.device
+                                and _r_prev.dtype == _tn_sd.dtype
                             ):
-                                _u = _tn_sd + _prev_res
+                                _u = _tn_sd + _r_prev
+                                _had_prev = True
                             else:
                                 _u = _tn_sd
-                            # Round-nearest-even to bf16, then back
-                            # to fp32 to compute new residual.
-                            _bf16 = _u.to(_torch_v24m.bfloat16)
+                                _had_prev = False
+                            # RNE fp32 -> bf16 and retrieve actual
+                            # quantized fp32 value for residual calc.
+                            _bf16 = _u.to(_torch_v16.bfloat16)
                             _bb = _bf16.float()
                             _new_res = (_u - _bb).detach().clone()
-                            self._mtp_sd_residual[_nm_sd] = _new_res
-                            # Count how many elements' bf16 state
-                            # differs from the plain RNE(_tn_sd)
-                            # baseline; this is the diagnostic
-                            # "sigma-delta shift".
+                            # Diagnostic: count elements whose bf16
+                            # representation differs from the plain
+                            # RNE(_tn_sd) baseline (i.e. how many were
+                            # "lifted" by accumulated residual).
                             try:
                                 _baseline_bf16 = _tn_sd.to(
-                                    _torch_v24m.bfloat16
+                                    _torch_v16.bfloat16
                                 )
-                                _sd_nonzero_shift += int(
+                                _shift_cnt = int(
                                     (_bf16 != _baseline_bf16)
-                                    .sum()
-                                    .item()
+                                    .sum().item()
                                 )
                             except Exception:
-                                pass
+                                _shift_cnt = -1
+                            self._mtp_sd_residual[_nm_sd] = _new_res
+                            self._mtp_sd_sync_idx[_nm_sd] = (
+                                self._mtp_sd_sync_idx.get(_nm_sd, 0) + 1
+                            )
+                            # Replace payload tensor with sigma-delta
+                            # bf16 version. Receiver (SGLang) will do
+                            # its own copy_ which is now bit-exact.
                             mtp_hf_tensors[_i] = (
                                 _nm_sd, _bf16.contiguous(),
                             )
                             _sd_applied += 1
+                            if _shift_cnt > 0:
+                                _sd_total_shifted += _shift_cnt
+                            # Per-tensor trace: first 5 tensors or
+                            # every 10th sync, to avoid spam.
+                            if (
+                                len(_sd_sample_details) < 5
+                                or (
+                                    self._mtp_sd_sync_idx[_nm_sd]
+                                    % 10 == 0
+                                )
+                            ):
+                                try:
+                                    _r_abs = float(
+                                        _new_res.abs().mean().item()
+                                    )
+                                    _r_max = float(
+                                        _new_res.abs().max().item()
+                                    )
+                                except Exception:
+                                    _r_abs, _r_max = -1.0, -1.0
+                                _sd_sample_details.append(
+                                    "name=%s shape=%s had_prev=%s "
+                                    "sync_idx=%d shifted_elems=%d "
+                                    "residual_abs_mean=%.3e "
+                                    "residual_abs_max=%.3e" % (
+                                        _nm_sd,
+                                        tuple(_tn_sd.shape),
+                                        str(_had_prev),
+                                        self._mtp_sd_sync_idx[_nm_sd],
+                                        _shift_cnt,
+                                        _r_abs, _r_max,
+                                    )
+                                )
                         if _sd_applied > 0:
                             self.logger.info(
-                                "[MTPSigmaDeltaBf16-v29] name=%s "
-                                "applied=%d total_shifted_elems=%d",
-                                name, _sd_applied,
-                                _sd_nonzero_shift,
+                                "[MTPSigmaDeltaBf16-v28] collect_name=%s "
+                                "applied=%d total_shifted_elems=%d "
+                                "samples=[%s]",
+                                name,
+                                _sd_applied, _sd_total_shifted,
+                                " | ".join(_sd_sample_details),
                             )
-                    # [MTPSigmaDeltaBf16-v29] END
                     # [MTPWeightDeltaD15] version-to-version
                     # abs_mean delta tracker.
                     if not hasattr(self, "_mtp_d15_prev_abs_mean"):
@@ -4660,105 +4720,163 @@ class MegatronEngine(TrainEngine):
                     )
                 except Exception:
                     pass
-        # [SGLangReadBackMTPv5-v31] HTTP-direct readback via RolloutCallback.
-        # spec_v1.log.12 proved rollout_engine._engine is None in PR#1176
-        # RolloutCallback mode (pure HTTP proxy). v31 dispatches a best-
-        # effort POST to {controller_addr}/callback/get_mtp_weight_norm
-        # and treats any non-2xx (incl. 404 when the controller does not
-        # implement the endpoint) as "unavailable" rather than a failure.
-        # If the endpoint IS present, the response JSON should contain
-        # {"norm": <float>, "name": <str>} allowing H2 arbitration.
+        # [MTPBf16PayloadNorm-v33] Engine-side wire-truth norm.
+        # After the sigma-delta path above (v28-v29), entries of
+        # mtp_hf_tensors that correspond to fp32 master MTP params
+        # have been *replaced* with their bf16 RNE-cast versions
+        # (see "_bf16.contiguous()" at the sigma-delta tail). Those
+        # exact bf16 bytes are the payload that sglang's
+        # eagle_worker.update_weights_from_tensor .copy_()s into
+        # BOTH draft_model_runner.model AND target_worker.model
+        # (eagle_worker.py:999). So |W|_bf16_wire IS the ground
+        # truth for "did the weights on the wire change". No HTTP
+        # roundtrip needed -> immune to the MiMo /get_weights_by_name
+        # architectural block that killed v32's readback.
         if _v31_on and mtp_hf_tensors:
             try:
-                _re = self.rollout_engine
-                _addr = getattr(_re, "controller_addr", None)
+                import torch as _torch_v33
+                _wire_sq = 0.0
+                _wire_cnt = 0
+                _wire_bf16_cnt = 0
+                _wire_fp32_cnt = 0
+                _first_name = None
+                _first_norm = None
+                for _nm_w, _tn_w in mtp_hf_tensors:
+                    _tw = _tn_w.detach()
+                    if _tw.dtype == _torch_v33.bfloat16:
+                        _wire_bf16_cnt += 1
+                    elif _tw.dtype == _torch_v33.float32:
+                        _wire_fp32_cnt += 1
+                    _tf = _tw.float()
+                    _s = float((_tf * _tf).sum().item())
+                    _wire_sq += _s
+                    _wire_cnt += int(_tf.numel())
+                    if _first_name is None:
+                        _first_name = _nm_w
+                        _first_norm = _s ** 0.5
+                _wire_norm = _wire_sq ** 0.5
+                _prev_wire = getattr(self, "_v33_prev_wire_norm", None)
+                self._v33_prev_wire_norm = _wire_norm
+                _d_wire = None
+                _d_wire_rel = None
+                if _prev_wire is not None and _wire_norm > 0:
+                    _d_wire = abs(_wire_norm - _prev_wire)
+                    _d_wire_rel = _d_wire / _wire_norm
                 try:
-                    _rk2 = (
+                    _rk_w = (
                         torch.distributed.get_rank()
                         if torch.distributed.is_initialized() else 0
                     )
                 except Exception:
-                    _rk2 = 0
-                if _rk2 == 0:
-                    if _addr is None:
-                        self.logger.info(
-                            "[SGLangReadBackMTPv5-v31] unavailable: "
-                            "rollout_engine=%s has no controller_addr",
-                            type(_re).__name__,
-                        )
-                    else:
-                        # [v32] Probe up to 3 MTP tensors and aggregate
-                        # the biggest rel_gap seen, so a single layer-
-                        # name mismatch does not falsely flag H2.
-                        _probes = mtp_hf_tensors[:3]
-                        _wire_url = (
-                            f"http://{_addr}/callback/"
-                            f"get_mtp_weight_norm"
-                        )
-                        _max_rel_gap = 0.0
-                        _any_ok = False
-                        _status_trace = []
-                        try:
-                            import requests as _rq_v32
-                            for _pn, _pt in _probes:
-                                _exp = float(
-                                    _pt.detach().float().norm().item()
-                                )
-                                _resp = _rq_v32.post(
-                                    _wire_url,
-                                    json={"name": _pn},
-                                    timeout=30.0,
-                                    proxies={"http": None, "https": None},
-                                )
-                                _status_trace.append(
-                                    f"{_pn}:{_resp.status_code}"
-                                )
-                                if _resp.status_code == 200:
-                                    _any_ok = True
-                                    try:
-                                        _jj = _resp.json()
-                                    except Exception:
-                                        _jj = {}
-                                    _wn = float(
-                                        _jj.get("norm", float("nan"))
-                                    )
-                                    _gap = abs(_wn - _exp)
-                                    _rg = _gap / max(_exp, 1e-12)
-                                    if _rg > _max_rel_gap:
-                                        _max_rel_gap = _rg
-                                    self.logger.info(
-                                        "[SGLangReadBackMTPv6-v32] "
-                                        "name=%s exp=%.6e wire=%.6e "
-                                        "rel_gap=%.4e",
-                                        _pn, _exp, _wn, _rg,
-                                    )
-                            if _any_ok:
-                                self.logger.info(
-                                    "[SGLangReadBackMTPv6-v32] "
-                                    "aggregate max_rel_gap=%.4e "
-                                    "H2=%s trace=%s",
-                                    _max_rel_gap,
-                                    "CONFIRMED" if _max_rel_gap >= 1e-3
-                                    else "REJECTED",
-                                    _status_trace,
-                                )
-                            else:
-                                self.logger.info(
-                                    "[SGLangReadBackMTPv6-v32] "
-                                    "unavailable: trace=%s url=%s",
-                                    _status_trace, _wire_url,
-                                )
-                        except Exception as _e_rb:
-                            self.logger.info(
-                                "[SGLangReadBackMTPv6-v32] http "
-                                "failure: %r addr=%s trace=%s",
-                                _e_rb, _addr, _status_trace,
-                            )
-            except Exception as _e_rb_outer:
+                    _rk_w = 0
+                if _rk_w == 0:
+                    _h2_wire = "UNKNOWN"
+                    if _d_wire is not None:
+                        if _d_wire == 0.0:
+                            _h2_wire = "CONFIRMED-STALL"
+                        elif _d_wire_rel is not None and _d_wire_rel < 1e-8:
+                            _h2_wire = "SUSPECT-MICRO"
+                        else:
+                            _h2_wire = "REJECTED"
+                    self.logger.info(
+                        "[MTPBf16PayloadNorm-v33] version=%s "
+                        "|W|_wire=%.6e (n=%d, bf16=%d fp32=%d) "
+                        "d|W|_wire=%s d|W|_wire_rel=%s "
+                        "first=%s first_norm=%s "
+                        "H2_wire=%s",
+                        str(meta.version),
+                        _wire_norm, _wire_cnt,
+                        _wire_bf16_cnt, _wire_fp32_cnt,
+                        ("%.6e" % _d_wire) if _d_wire is not None else "NA",
+                        ("%.4e" % _d_wire_rel) if _d_wire_rel is not None else "NA",
+                        str(_first_name),
+                        ("%.6e" % _first_norm) if _first_norm is not None else "NA",
+                        _h2_wire,
+                    )
+            except Exception as _e_v33_wire:
                 try:
                     self.logger.warning(
-                        "[SGLangReadBackMTPv5-v31] outer failure: %r",
-                        _e_rb_outer,
+                        "[MTPBf16PayloadNorm-v33] failed: %r",
+                        _e_v33_wire,
+                    )
+                except Exception:
+                    pass
+        # [MTPProbeLogprob-v33] Deterministic inference probe via
+        # /callback/get_mtp_probe.  Replaces the architecturally-
+        # broken v32 /callback/get_mtp_weight_norm path. The probe
+        # posts a fixed prompt with temperature=0, top_p=1, top_k=1,
+        # max_new_tokens=1, return_logprob=1 to server_infos[0] and
+        # returns the first input_token_logprob.
+        if _v31_on and mtp_hf_tensors:
+            try:
+                _re_p = self.rollout_engine
+                _addr_p = getattr(_re_p, "controller_addr", None)
+                try:
+                    _rk_p = (
+                        torch.distributed.get_rank()
+                        if torch.distributed.is_initialized() else 0
+                    )
+                except Exception:
+                    _rk_p = 0
+                if _rk_p == 0:
+                    if _addr_p is None:
+                        self.logger.info(
+                            "[MTPProbeLogprob-v33] unavailable: "
+                            "rollout_engine=%s has no controller_addr",
+                            type(_re_p).__name__,
+                        )
+                    else:
+                        try:
+                            import requests as _rq_v33
+                            _probe_url = (
+                                f"http://{_addr_p}/callback/"
+                                f"get_mtp_probe"
+                            )
+                            _resp = _rq_v33.post(
+                                _probe_url,
+                                json={"version": int(meta.version)},
+                                timeout=30.0,
+                                proxies={"http": None, "https": None},
+                            )
+                            _status = _resp.status_code
+                            _jp = {}
+                            try:
+                                _jp = _resp.json()
+                            except Exception:
+                                _jp = {}
+                            _lp = _jp.get("logprob", None)
+                            _server = _jp.get("server", None)
+                            _err = _jp.get("error", None)
+                            _prev_lp = getattr(
+                                self, "_v33_prev_probe_logprob", None
+                            )
+                            if isinstance(_lp, (int, float)):
+                                self._v33_prev_probe_logprob = float(_lp)
+                                _d_lp = (
+                                    None if _prev_lp is None
+                                    else abs(float(_lp) - float(_prev_lp))
+                                )
+                            else:
+                                _d_lp = None
+                            self.logger.info(
+                                "[MTPProbeLogprob-v33] version=%s "
+                                "status=%s logprob=%s d_logprob=%s "
+                                "server=%s err=%s",
+                                str(meta.version), _status,
+                                ("%.6e" % _lp) if isinstance(_lp, (int, float)) else "NA",
+                                ("%.6e" % _d_lp) if isinstance(_d_lp, (int, float)) else "NA",
+                                _server, _err,
+                            )
+                        except Exception as _e_p:
+                            self.logger.info(
+                                "[MTPProbeLogprob-v33] http failure: %r",
+                                _e_p,
+                            )
+            except Exception as _e_p_out:
+                try:
+                    self.logger.warning(
+                        "[MTPProbeLogprob-v33] outer failure: %r",
+                        _e_p_out,
                     )
                 except Exception:
                     pass

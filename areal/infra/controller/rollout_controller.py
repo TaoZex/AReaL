@@ -744,33 +744,32 @@ class RolloutController:
             except Exception as e:
                 return jsonify({"error": str(e)}), 500
 
-        # ------------------------------------------------------------
-        # [v32] /callback/get_mtp_weight_norm
-        # ------------------------------------------------------------
-        # Proxy endpoint that lets the training-side MegatronEngine
-        # confirm whether MTP weights it just pushed via
-        # /update_weights_from_tensor actually landed on the SGLang
-        # server.  Calls SGLang's built-in /get_weights_by_name on
-        # the first registered inference server (rank 0) and returns
-        # a scalar Frobenius norm of the parameter plus its dtype.
-        #
-        # Payload: {"name": <parameter_name>}
-        # Response: {"name": <str>, "norm": <float>, "dtype": <str>,
-        #            "numel": <int>, "server": <host:port>}
-        #
-        # Any transport failure or unknown param returns HTTP 200
-        # with {"error": <str>, "server": <host:port|null>} so that
-        # the training side can distinguish between "endpoint
-        # missing" (prev versions returning 404/500) and "real H2
-        # signal".
+        # [v32] /callback/get_mtp_weight_norm -- DEPRECATED in v33.
+        # SGLang MiMo does not expose /get_weights_by_name; the
+        # endpoint always returns {"error": "sglang status=404"}.
+        # Replaced by /callback/get_mtp_probe (deterministic
+        # inference probe).  Kept as a 200+error stub so old
+        # MegatronEngine code does not crash on missing route.
         @app.route("/callback/get_mtp_weight_norm", methods=["POST"])
         def get_mtp_weight_norm():
+            return jsonify(
+                {"error": "deprecated-v33", "server": None}
+            ), 200
+
+        # ------------------------------------------------------------
+        # [v33] /callback/get_mtp_probe
+        # ------------------------------------------------------------
+        # Deterministic inference probe: sends a fixed prompt to
+        # server_infos[0] with temperature=0, top_p=1, top_k=1,
+        # max_new_tokens=1, return_logprob=1 and returns the first
+        # input_token_logprob.  This is a functional end-to-end
+        # check: if the draft model's logprobs change across weight
+        # syncs, the weights are actually being used by the
+        # speculative decoder.
+        @app.route("/callback/get_mtp_probe", methods=["POST"])
+        def get_mtp_probe():
             payload = request.get_json() or {}
-            _name = payload.get("name")
-            if not _name:
-                return jsonify(
-                    {"error": "missing 'name'"}
-                ), 200
+            _version = payload.get("version", -1)
             _srv = None
             try:
                 if not self.server_infos:
@@ -781,21 +780,27 @@ class RolloutController:
                 _s0 = self.server_infos[0]
                 _srv = f"{_s0.host}:{_s0.port}"
                 try:
-                    import math as _math_v32
-                    import requests as _rq_v32c
+                    import requests as _rq_v33c
                 except Exception as _e_imp:
                     return jsonify(
                         {"error": f"import fail: {_e_imp!r}",
                          "server": _srv}
                     ), 200
-                _url = f"http://{_srv}/get_weights_by_name"
-                # truncate_size=-1 returns the full tensor as a
-                # (nested) python list so we can compute an exact
-                # Frobenius norm on the wire side.
+                _url = f"http://{_srv}/generate"
+                _probe_text = "The answer is"
                 try:
-                    _r = _rq_v32c.post(
+                    _r = _rq_v33c.post(
                         _url,
-                        json={"name": _name, "truncate_size": -1},
+                        json={
+                            "text": _probe_text,
+                            "sampling_params": {
+                                "temperature": 0,
+                                "top_p": 1,
+                                "top_k": 1,
+                                "max_new_tokens": 1,
+                            },
+                            "return_logprob": True,
+                        },
                         timeout=60.0,
                         proxies={"http": None, "https": None},
                     )
@@ -804,7 +809,6 @@ class RolloutController:
                         {
                             "error": f"http fail: {_e_http!r}",
                             "server": _srv,
-                            "url": _url,
                         }
                     ), 200
                 if _r.status_code != 200:
@@ -812,7 +816,6 @@ class RolloutController:
                         {
                             "error": f"sglang status={_r.status_code}",
                             "server": _srv,
-                            "url": _url,
                             "body": _r.text[:400],
                         }
                     ), 200
@@ -825,46 +828,31 @@ class RolloutController:
                             "server": _srv,
                         }
                     ), 200
-                # sglang may return {'parameter': ...} OR the raw list.
-                _param = _j
-                if isinstance(_j, dict):
-                    _param = _j.get("parameter", _j)
-                # Flatten arbitrarily-nested lists and compute norm.
-                _sq = 0.0
-                _numel = 0
-                def _walk(_x):
-                    nonlocal _sq, _numel
-                    if isinstance(_x, list):
-                        for _y in _x:
-                            _walk(_y)
-                    else:
-                        try:
-                            _v = float(_x)
-                        except Exception:
-                            return
-                        _sq += _v * _v
-                        _numel += 1
+                _logprob = None
                 try:
-                    _walk(_param)
-                except Exception as _e_w:
-                    return jsonify(
-                        {
-                            "error": f"walk fail: {_e_w!r}",
-                            "server": _srv,
-                        }
-                    ), 200
-                _norm = _sq ** 0.5
+                    _meta_out = _j.get("meta_info", {})
+                    _lp_list = _meta_out.get("input_token_logprobs", [])
+                    if _lp_list:
+                        _logprob = _lp_list[0]
+                        if isinstance(_logprob, list):
+                            _logprob = _logprob[0]
+                        elif isinstance(_logprob, dict):
+                            _logprob = _logprob.get(
+                                "logprob",
+                                _logprob.get("prob", None),
+                            )
+                except Exception:
+                    pass
                 return jsonify(
                     {
-                        "name": _name,
-                        "norm": _norm,
-                        "numel": _numel,
+                        "version": _version,
+                        "logprob": _logprob,
                         "server": _srv,
                     }
                 ), 200
             except Exception as _e:
                 logger.warning(
-                    f"[v32] get_mtp_weight_norm unexpected: {_e!r}"
+                    f"[v33] get_mtp_probe unexpected: {_e!r}"
                 )
                 return jsonify(
                     {"error": repr(_e), "server": _srv}
