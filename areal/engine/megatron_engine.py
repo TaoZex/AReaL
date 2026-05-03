@@ -219,10 +219,11 @@ class MegatronEngine(TrainEngine):
                         _os_banner.environ.get(
                             "AREAL_MTP_FP32_MASTER_READ", "1"),
                 }
-                # [MTPVersionBanner-v28] Added iter16 instrumentation: SGLangReadBackMTPv3-v28(CallbackPath) / MTPBf16ULPProof-v28.
-                _banner_tags = list(_banner_tags) + ["v27:SGLangReadBackMTPv2-HTTP+MainGrad+Fp32Delta", "v28:SGLangReadBackMTPv3-CallbackPath+MTPBf16ULPProof"]
+                # [MTPVersionBanner-v29] Added iter16 instrumentation: SGLangReadBackMTPv3-v28(CallbackPath) / MTPBf16ULPProof-v28.
+                _banner_tags = list(_banner_tags) + ["v27:SGLangReadBackMTPv2-HTTP+MainGrad+Fp32Delta", "v28:SGLangReadBackMTPv3-CallbackPath+MTPBf16ULPProof",
+                    "v29:SigmaDeltaBf16(AREAL_MTP_SIGMA_DELTA_BF16)+SglangGetAddrsFix"]
                 self.logger.info(
-                    "[MTPVersionBanner-v28] tags=%s flags=%s",
+                    "[MTPVersionBanner-v29] tags=%s flags=%s",
                     ",".join(_banner_tags), _banner_flags,
                 )
                 try:
@@ -4227,6 +4228,91 @@ class MegatronEngine(TrainEngine):
                                 "MTP tensors bf16->fp32 (name=%s).",
                                 _upcasted, name,
                             )
+                    # [MTPSigmaDeltaBf16-v29] Residual-carried bf16
+                    # quantization of the fp32 MTP payload. This is
+                    # the iter17 functional fix that addresses the
+                    # bf16-ULP flooring 100% confirmed from log.10:
+                    #   - LayerNorm weights frozen across consecutive
+                    #     MTP sync events (MTPBf16ULPProof-v28 showed
+                    #     bf16cast_eq_prev_bf16cast==numel on final/
+                    #     input/hidden/post_attention/token_layernorm)
+                    #   - fp32 master delta per step ~2e-6 (log.10
+                    #     MTPFp32Delta-v27), well below bf16 ULP at
+                    #     |w|=3 (~1.56e-2), so SGLang's bf16 draft
+                    #     weight never moves for these tensors.
+                    # We carry each step's round-off residual into
+                    # the next sync event so cumulative sub-ULP
+                    # deltas eventually "tick" the bf16 weight one
+                    # ULP at a time -- classic Sigma-Delta / noise-
+                    # shaped quantization. This turns the SGLang-
+                    # side bf16 target dtype from a hard floor into
+                    # a dithered representation of the fp32 master
+                    # without introducing per-element ULP jitter
+                    # (pure stochastic rounding would do that).
+                    try:
+                        _sd_on = (
+                            _os_v24m.environ.get(
+                                "AREAL_MTP_SIGMA_DELTA_BF16", "1",
+                            ) == "1"
+                        )
+                    except Exception:
+                        _sd_on = True
+                    if _sd_on:
+                        if not hasattr(self, "_mtp_sd_residual"):
+                            self._mtp_sd_residual = {}
+                        _sd_applied = 0
+                        _sd_nonzero_shift = 0
+                        for _i in range(_prev_count, len(mtp_hf_tensors)):
+                            _nm_sd, _tn_sd = mtp_hf_tensors[_i]
+                            # Only apply to fp32 tensors (the upcast
+                            # step above may have produced fp32; if
+                            # still bf16 here, nothing to do).
+                            if _tn_sd.dtype != _torch_v24m.float32:
+                                continue
+                            _prev_res = self._mtp_sd_residual.get(
+                                _nm_sd
+                            )
+                            if (
+                                _prev_res is not None
+                                and _prev_res.shape == _tn_sd.shape
+                                and _prev_res.device == _tn_sd.device
+                            ):
+                                _u = _tn_sd + _prev_res
+                            else:
+                                _u = _tn_sd
+                            # Round-nearest-even to bf16, then back
+                            # to fp32 to compute new residual.
+                            _bf16 = _u.to(_torch_v24m.bfloat16)
+                            _bb = _bf16.float()
+                            _new_res = (_u - _bb).detach().clone()
+                            self._mtp_sd_residual[_nm_sd] = _new_res
+                            # Count how many elements' bf16 state
+                            # differs from the plain RNE(_tn_sd)
+                            # baseline; this is the diagnostic
+                            # "sigma-delta shift".
+                            try:
+                                _baseline_bf16 = _tn_sd.to(
+                                    _torch_v24m.bfloat16
+                                )
+                                _sd_nonzero_shift += int(
+                                    (_bf16 != _baseline_bf16)
+                                    .sum()
+                                    .item()
+                                )
+                            except Exception:
+                                pass
+                            mtp_hf_tensors[_i] = (
+                                _nm_sd, _bf16.contiguous(),
+                            )
+                            _sd_applied += 1
+                        if _sd_applied > 0:
+                            self.logger.info(
+                                "[MTPSigmaDeltaBf16-v29] name=%s "
+                                "applied=%d total_shifted_elems=%d",
+                                name, _sd_applied,
+                                _sd_nonzero_shift,
+                            )
+                    # [MTPSigmaDeltaBf16-v29] END
                     # [MTPWeightDeltaD15] version-to-version
                     # abs_mean delta tracker.
                     if not hasattr(self, "_mtp_d15_prev_abs_mean"):

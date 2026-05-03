@@ -463,6 +463,18 @@ class RemoteSGLangEngine(InferenceEngine):
         """Update weights from distributed memory."""
         return self._engine.update_weights_from_distributed(meta, param_specs)
 
+    def get_addresses(self) -> list:
+        """[v29] Delegate address lookup to the composed RemoteInfEngine.
+
+        Needed so RolloutController._collective_rpc_async("get_addresses")
+        resolves on the RemoteSGLangEngine wrapper registered on the
+        rollout worker.
+        """
+        try:
+            return self._engine.get_addresses()
+        except Exception:
+            return []
+
     def update_weights_from_tensor(
         self,
         named_tensors: list[tuple[str, torch.Tensor]] | None = None,
