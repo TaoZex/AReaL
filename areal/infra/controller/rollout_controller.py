@@ -744,6 +744,132 @@ class RolloutController:
             except Exception as e:
                 return jsonify({"error": str(e)}), 500
 
+        # ------------------------------------------------------------
+        # [v32] /callback/get_mtp_weight_norm
+        # ------------------------------------------------------------
+        # Proxy endpoint that lets the training-side MegatronEngine
+        # confirm whether MTP weights it just pushed via
+        # /update_weights_from_tensor actually landed on the SGLang
+        # server.  Calls SGLang's built-in /get_weights_by_name on
+        # the first registered inference server (rank 0) and returns
+        # a scalar Frobenius norm of the parameter plus its dtype.
+        #
+        # Payload: {"name": <parameter_name>}
+        # Response: {"name": <str>, "norm": <float>, "dtype": <str>,
+        #            "numel": <int>, "server": <host:port>}
+        #
+        # Any transport failure or unknown param returns HTTP 200
+        # with {"error": <str>, "server": <host:port|null>} so that
+        # the training side can distinguish between "endpoint
+        # missing" (prev versions returning 404/500) and "real H2
+        # signal".
+        @app.route("/callback/get_mtp_weight_norm", methods=["POST"])
+        def get_mtp_weight_norm():
+            payload = request.get_json() or {}
+            _name = payload.get("name")
+            if not _name:
+                return jsonify(
+                    {"error": "missing 'name'"}
+                ), 200
+            _srv = None
+            try:
+                if not self.server_infos:
+                    return jsonify(
+                        {"error": "no server_infos",
+                         "server": None}
+                    ), 200
+                _s0 = self.server_infos[0]
+                _srv = f"{_s0.host}:{_s0.port}"
+                try:
+                    import math as _math_v32
+                    import requests as _rq_v32c
+                except Exception as _e_imp:
+                    return jsonify(
+                        {"error": f"import fail: {_e_imp!r}",
+                         "server": _srv}
+                    ), 200
+                _url = f"http://{_srv}/get_weights_by_name"
+                # truncate_size=-1 returns the full tensor as a
+                # (nested) python list so we can compute an exact
+                # Frobenius norm on the wire side.
+                try:
+                    _r = _rq_v32c.post(
+                        _url,
+                        json={"name": _name, "truncate_size": -1},
+                        timeout=60.0,
+                        proxies={"http": None, "https": None},
+                    )
+                except Exception as _e_http:
+                    return jsonify(
+                        {
+                            "error": f"http fail: {_e_http!r}",
+                            "server": _srv,
+                            "url": _url,
+                        }
+                    ), 200
+                if _r.status_code != 200:
+                    return jsonify(
+                        {
+                            "error": f"sglang status={_r.status_code}",
+                            "server": _srv,
+                            "url": _url,
+                            "body": _r.text[:400],
+                        }
+                    ), 200
+                try:
+                    _j = _r.json()
+                except Exception as _e_js:
+                    return jsonify(
+                        {
+                            "error": f"json fail: {_e_js!r}",
+                            "server": _srv,
+                        }
+                    ), 200
+                # sglang may return {'parameter': ...} OR the raw list.
+                _param = _j
+                if isinstance(_j, dict):
+                    _param = _j.get("parameter", _j)
+                # Flatten arbitrarily-nested lists and compute norm.
+                _sq = 0.0
+                _numel = 0
+                def _walk(_x):
+                    nonlocal _sq, _numel
+                    if isinstance(_x, list):
+                        for _y in _x:
+                            _walk(_y)
+                    else:
+                        try:
+                            _v = float(_x)
+                        except Exception:
+                            return
+                        _sq += _v * _v
+                        _numel += 1
+                try:
+                    _walk(_param)
+                except Exception as _e_w:
+                    return jsonify(
+                        {
+                            "error": f"walk fail: {_e_w!r}",
+                            "server": _srv,
+                        }
+                    ), 200
+                _norm = _sq ** 0.5
+                return jsonify(
+                    {
+                        "name": _name,
+                        "norm": _norm,
+                        "numel": _numel,
+                        "server": _srv,
+                    }
+                ), 200
+            except Exception as _e:
+                logger.warning(
+                    f"[v32] get_mtp_weight_norm unexpected: {_e!r}"
+                )
+                return jsonify(
+                    {"error": repr(_e), "server": _srv}
+                ), 200
+
         @app.errorhandler(Exception)
         def handle_error(e):
             logger.error(

@@ -207,7 +207,7 @@ class MegatronEngine(TrainEngine):
                     "v23:NoDPCollective+TPConsensus+MainParamViewDirect",
                     "v24:TPDtypeSymmetric+NonPPHeadAlsoFp32",
                     "v25:AcceptEMA+GradProbe+PostOptim+Bf16Drift+SendPreBcast",
-                    "v31:MTPRelativeSpeed+SignalAudit+ReadBackHTTP(AREAL_MTP_V30_DIAG)",
+                    "v32:AuditLatch+ReadBackEndpoint(AREAL_MTP_V30_DIAG)",
                 ]
                 _banner_flags = {
                     "AREAL_MTP_FP32_BROADCAST":
@@ -2689,6 +2689,20 @@ class MegatronEngine(TrainEngine):
                 group=mpu.get_pipeline_model_parallel_group(),
             )
             data.update(data_list[0])
+        # [v32] Snapshot the reduced stats dict so the MTP weight-
+        # sync path can read task_reward / entropy / accept_rate
+        # without re-entering stats_tracker (which would reset the
+        # accumulators on export).
+        try:
+            self._last_stats_snapshot_v32 = dict(data)
+            _tr = data.get("ppo_actor/task_reward/avg")
+            _ea = data.get("ppo_actor/update/entropy/avg")
+            if isinstance(_tr, (int, float)):
+                self._last_task_reward_avg = float(_tr)
+            if isinstance(_ea, (int, float)):
+                self._last_entropy_avg = float(_ea)
+        except Exception:
+            pass
         return data
 
     def offload(self) -> None:
@@ -4579,29 +4593,24 @@ class MegatronEngine(TrainEngine):
                     _mtp_loss_ema = getattr(self, "_mtp_loss_ema", None)
                     _mtp_loss_val = getattr(self, "_mtp_loss_value", None)
                     _mtp_lr_cache = getattr(self, "_last_logged_mtp_lr", None)
-                    # task_reward/entropy come from stats_tracker; fall
-                    # back gracefully across API shapes.
+                    # [v32] Read task_reward / entropy from the
+                    # engine-side snapshot populated by our
+                    # export_stats override (see export_stats below).
+                    # The v31 stats_tracker.get('<stat_key>') path
+                    # returned an empty DistributedStatsTracker (get
+                    # is keyed by TRACKER name, not stat name).
+                    _latest = getattr(
+                        self, "_last_stats_snapshot_v32", None
+                    )
                     _task_reward = None
                     _entropy_avg = None
-                    try:
-                        from areal.utils import stats_tracker as _st_v31
-                        for _attr in ("get", "peek", "last"):
-                            _fn = getattr(_st_v31, _attr, None)
-                            if not callable(_fn):
-                                continue
-                            try:
-                                _task_reward = _fn(
-                                    "ppo_actor/task_reward/avg"
-                                )
-                                _entropy_avg = _fn(
-                                    "ppo_actor/update/entropy/avg"
-                                )
-                                if _task_reward is not None:
-                                    break
-                            except Exception:
-                                continue
-                    except Exception:
-                        pass
+                    if isinstance(_latest, dict):
+                        _task_reward = _latest.get(
+                            "ppo_actor/task_reward/avg"
+                        )
+                        _entropy_avg = _latest.get(
+                            "ppo_actor/update/entropy/avg"
+                        )
                     if _task_reward is None:
                         _task_reward = getattr(
                             self, "_last_task_reward_avg", None
@@ -4678,46 +4687,72 @@ class MegatronEngine(TrainEngine):
                             type(_re).__name__,
                         )
                     else:
-                        _probe_name, _probe_tensor = mtp_hf_tensors[0]
-                        _expected_norm = float(
-                            _probe_tensor.detach().float().norm().item()
+                        # [v32] Probe up to 3 MTP tensors and aggregate
+                        # the biggest rel_gap seen, so a single layer-
+                        # name mismatch does not falsely flag H2.
+                        _probes = mtp_hf_tensors[:3]
+                        _wire_url = (
+                            f"http://{_addr}/callback/"
+                            f"get_mtp_weight_norm"
                         )
+                        _max_rel_gap = 0.0
+                        _any_ok = False
+                        _status_trace = []
                         try:
-                            import requests as _rq_v31
-                            _url = (
-                                f"http://{_addr}/callback/"
-                                f"get_mtp_weight_norm"
-                            )
-                            _resp = _rq_v31.post(
-                                _url,
-                                json={"name": _probe_name},
-                                timeout=30.0,
-                                proxies={"http": None, "https": None},
-                            )
-                            if _resp.status_code == 200:
-                                _j = _resp.json()
-                                _wire = float(_j.get("norm", float("nan")))
-                                _gap = abs(_wire - _expected_norm)
-                                _rel_gap = _gap / max(_expected_norm, 1e-12)
+                            import requests as _rq_v32
+                            for _pn, _pt in _probes:
+                                _exp = float(
+                                    _pt.detach().float().norm().item()
+                                )
+                                _resp = _rq_v32.post(
+                                    _wire_url,
+                                    json={"name": _pn},
+                                    timeout=30.0,
+                                    proxies={"http": None, "https": None},
+                                )
+                                _status_trace.append(
+                                    f"{_pn}:{_resp.status_code}"
+                                )
+                                if _resp.status_code == 200:
+                                    _any_ok = True
+                                    try:
+                                        _jj = _resp.json()
+                                    except Exception:
+                                        _jj = {}
+                                    _wn = float(
+                                        _jj.get("norm", float("nan"))
+                                    )
+                                    _gap = abs(_wn - _exp)
+                                    _rg = _gap / max(_exp, 1e-12)
+                                    if _rg > _max_rel_gap:
+                                        _max_rel_gap = _rg
+                                    self.logger.info(
+                                        "[SGLangReadBackMTPv6-v32] "
+                                        "name=%s exp=%.6e wire=%.6e "
+                                        "rel_gap=%.4e",
+                                        _pn, _exp, _wn, _rg,
+                                    )
+                            if _any_ok:
                                 self.logger.info(
-                                    "[SGLangReadBackMTPv5-v31] name=%s "
-                                    "expected_norm=%.6e wire_norm=%.6e "
-                                    "rel_gap=%.4e H2=%s",
-                                    _probe_name, _expected_norm, _wire,
-                                    _rel_gap,
-                                    "CONFIRMED" if _rel_gap >= 1e-3
+                                    "[SGLangReadBackMTPv6-v32] "
+                                    "aggregate max_rel_gap=%.4e "
+                                    "H2=%s trace=%s",
+                                    _max_rel_gap,
+                                    "CONFIRMED" if _max_rel_gap >= 1e-3
                                     else "REJECTED",
+                                    _status_trace,
                                 )
                             else:
                                 self.logger.info(
-                                    "[SGLangReadBackMTPv5-v31] unavailable: "
-                                    "endpoint status=%d url=%s",
-                                    _resp.status_code, _url,
+                                    "[SGLangReadBackMTPv6-v32] "
+                                    "unavailable: trace=%s url=%s",
+                                    _status_trace, _wire_url,
                                 )
                         except Exception as _e_rb:
                             self.logger.info(
-                                "[SGLangReadBackMTPv5-v31] http failure: "
-                                "%r addr=%s", _e_rb, _addr,
+                                "[SGLangReadBackMTPv6-v32] http "
+                                "failure: %r addr=%s trace=%s",
+                                _e_rb, _addr, _status_trace,
                             )
             except Exception as _e_rb_outer:
                 try:
