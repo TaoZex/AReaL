@@ -219,9 +219,10 @@ class MegatronEngine(TrainEngine):
                         _os_banner.environ.get(
                             "AREAL_MTP_FP32_MASTER_READ", "1"),
                 }
-                # [MTPVersionBanner-v27] Added iter14 instrumentation: MTPSerializeSendMTP-v26 / MTPGradProbe-v26 / SGLangReadBackMTP-v26.
+                # [MTPVersionBanner-v28] Added iter16 instrumentation: SGLangReadBackMTPv3-v28(CallbackPath) / MTPBf16ULPProof-v28.
+                _banner_tags = list(_banner_tags) + ["v27:SGLangReadBackMTPv2-HTTP+MainGrad+Fp32Delta", "v28:SGLangReadBackMTPv3-CallbackPath+MTPBf16ULPProof"]
                 self.logger.info(
-                    "[MTPVersionBanner-v27] tags=%s flags=%s",
+                    "[MTPVersionBanner-v28] tags=%s flags=%s",
                     ",".join(_banner_tags), _banner_flags,
                 )
                 try:
@@ -3465,6 +3466,49 @@ class MegatronEngine(TrainEngine):
                     float(_v26_t.abs().max().item()),
                     _v26_first8,
                 )
+                # [MTPBf16ULPProof-v28] Prove/disprove bf16 ULP flooring on receiver side.
+                try:
+                    import torch as _torch_v28p
+                    if not hasattr(self, "_mtp_v28_prev_bf16cast"):
+                        self._mtp_v28_prev_bf16cast = {}
+                    _v28_tf = _v26_t.float()
+                    _v28_bf16 = _v28_tf.to(_torch_v28p.bfloat16)
+                    _v28_bb = _v28_bf16.float()
+                    _v28_eqcast = int((_v28_tf == _v28_bb).sum().item())
+                    _v28_numel = int(_v28_tf.numel())
+                    _v28_frac = _v28_eqcast / max(1, _v28_numel)
+                    _v28_prev = self._mtp_v28_prev_bf16cast.get(
+                        _v26_name
+                    )
+                    if _v28_prev is None:
+                        _v28_unchanged = None
+                    else:
+                        try:
+                            if _v28_prev.shape == _v28_bb.shape:
+                                _v28_unchanged = int(
+                                    (_v28_bb == _v28_prev).sum().item()
+                                )
+                            else:
+                                _v28_unchanged = -2
+                        except Exception:
+                            _v28_unchanged = -1
+                    self._mtp_v28_prev_bf16cast[_v26_name] = (
+                        _v28_bb.detach().clone()
+                    )
+                    self.logger.info(
+                        "[MTPBf16ULPProof-v28] name=%s numel=%d "
+                        "fp32_eq_bf16cast=%d (frac=%.4f) "
+                        "bf16cast_eq_prev_bf16cast=%s",
+                        _v26_name, _v28_numel, _v28_eqcast,
+                        _v28_frac,
+                        ("n/a" if _v28_unchanged is None
+                         else str(_v28_unchanged)),
+                    )
+                except Exception as _e_v28p:
+                    self.logger.warning(
+                        "[MTPBf16ULPProof-v28] error name=%s: %s",
+                        _v26_name, _e_v28p,
+                    )
         except Exception as _e_v26s:
             self.logger.warning(
                 "[MTPSerializeSendMTP-v26] probe error: %s", _e_v26s,
@@ -4711,6 +4755,55 @@ class MegatronEngine(TrainEngine):
                     self.logger.warning(
                         "[SGLangReadBackMTPv2-v27] outer error: %s",
                         _e_v27rb,
+                    )
+                # [SGLangReadBackMTPv3-v28] Callback-chain readback.
+                # In AReaL single-controller mode, self.rollout_engine
+                # is a RolloutCallback.  v27 used
+                # RemoteSGLangEngine._engine.addresses, which only
+                # exists on inference-side workers, not on the
+                # train-side MegatronEngine (log.9 proved it).  v28
+                # walks callback -> controller -> worker chain that
+                # already exists for /callback/update_weights_tensor.
+                try:
+                    _v28_probe_names = [
+                        "model.mtp_layers.0.token_layernorm.weight",
+                        "model.mtp_layers.0.hidden_layernorm.weight",
+                        "model.mtp_layers.0.input_layernorm.weight",
+                        "model.mtp_layers.0.post_attention_layernorm.weight",
+                        "model.mtp_layers.0.final_layernorm.weight",
+                    ]
+                    _v28_read = getattr(
+                        self.rollout_engine,
+                        "read_weights_by_name",
+                        None,
+                    )
+                    if _v28_read is not None:
+                        _v28_resp = _v28_read(
+                            names=_v28_probe_names, truncate_size=8,
+                        )
+                        _v28_entries = []
+                        if isinstance(_v28_resp, dict):
+                            _v28_entries = _v28_resp.get("entries", [])
+                        for _ent in _v28_entries:
+                            self.logger.info(
+                                "[SGLangReadBackMTPv3-v28] name=%s "
+                                "status=%s dtype=%s first8=%s body=%s",
+                                _ent.get("name"),
+                                _ent.get("status"),
+                                _ent.get("dtype"),
+                                _ent.get("first8"),
+                                (str(_ent.get("body", ""))[:240]),
+                            )
+                    else:
+                        self.logger.info(
+                            "[SGLangReadBackMTPv3-v28] rollout_engine "
+                            "lacks read_weights_by_name (engine_type=%s).",
+                            type(self.rollout_engine).__name__,
+                        )
+                except Exception as _e_v28rb:
+                    self.logger.warning(
+                        "[SGLangReadBackMTPv3-v28] outer error: %s",
+                        _e_v28rb,
                     )
                 _t_call1 = _time.time()
                 self.logger.info(

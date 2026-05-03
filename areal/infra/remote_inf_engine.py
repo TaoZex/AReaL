@@ -1350,6 +1350,17 @@ class RemoteInfEngine(InferenceEngine):
         onload_req = self.backend.get_onload_request(tags=tags)
         self._run_request_on_all_servers(onload_req)
 
+    def get_addresses(self) -> list:
+        """[v28] Expose this worker's inference-server addresses.
+
+        Used by RolloutController.read_weights_by_name to reach
+        SGLang's /get_weights_by_parameter_name endpoint directly.
+        """
+        try:
+            return list(self.addresses or [])
+        except Exception:
+            return []
+
     def _run_request_on_all_servers(self, req: HttpRequest):
         import time as _time
 

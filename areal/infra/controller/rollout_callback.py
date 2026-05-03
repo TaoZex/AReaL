@@ -93,6 +93,32 @@ class RolloutCallback:
             )
             raise
 
+    def read_weights_by_name(
+        self,
+        names,
+        truncate_size: int = 8,
+    ) -> dict:
+        """[v28] Read back SGLang draft weights via the callback chain.
+
+        Forwards to /callback/read_weights_by_name on RolloutController,
+        which selects the first worker, fetches its RemoteInfEngine
+        addresses[0], and calls SGLang's /get_weights_by_parameter_name.
+        """
+        payload = {
+            "names": list(names),
+            "truncate_size": int(truncate_size),
+        }
+        try:
+            return self._post(
+                "/callback/read_weights_by_name", payload,
+            )
+        except Exception as e:
+            logger.warning(
+                "[DiagMTP][Callback] read_weights_by_name FAILED: %s",
+                e,
+            )
+            return {"entries": [], "error": str(e)}
+
     def _post_nowait(
         self, endpoint: str, payload: dict[str, Any] | None = None
     ) -> Future[dict]:

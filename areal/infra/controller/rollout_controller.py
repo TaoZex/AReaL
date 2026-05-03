@@ -712,6 +712,28 @@ class RolloutController:
                 raise
             return jsonify({"status": "ok"})
 
+        @app.route("/callback/read_weights_by_name", methods=["POST"])
+        def read_weights_by_name_route():
+            payload = request.get_json() or {}
+            names = payload.get("names", []) or []
+            truncate_size = int(payload.get("truncate_size", 8) or 8)
+            try:
+                fut = asyncio.run_coroutine_threadsafe(
+                    self.read_weights_by_name(
+                        names=names,
+                        truncate_size=truncate_size,
+                    ),
+                    self._callback_loop,
+                )
+                entries = fut.result()
+                return jsonify({"entries": entries})
+            except Exception as _e:
+                logger.warning(
+                    "[DiagMTP] /callback/read_weights_by_name FAILED: %s",
+                    _e,
+                )
+                return jsonify({"entries": [], "error": str(_e)})
+
         @app.route("/callback/rollout_complete", methods=["POST"])
         def rollout_complete():
             payload = request.get_json() or {}
@@ -1318,6 +1340,85 @@ class RolloutController:
                 exc_info=True,
             )
             raise
+
+    async def read_weights_by_name(
+        self,
+        names,
+        truncate_size: int = 8,
+    ) -> list:
+        """[v28] Delegate SGLang HTTP read-by-name.
+
+        Uses a lightweight worker RPC to fetch RemoteInfEngine
+        addresses, then calls SGLang's /get_weights_by_parameter_name
+        directly over HTTP from the controller process.
+        """
+        import requests as _v28_requests
+        entries: list = []
+        try:
+            addr_list = await self._collective_rpc_async(
+                "get_addresses", http_timeout=60.0,
+            )
+        except Exception as _e_addr:
+            logger.warning(
+                "[DiagMTP] read_weights_by_name: addr RPC failed: %s",
+                _e_addr,
+            )
+            addr_list = []
+        flat_addrs: list = []
+        for a in addr_list or []:
+            if isinstance(a, (list, tuple)):
+                flat_addrs.extend(a)
+            elif a:
+                flat_addrs.append(a)
+        if not flat_addrs:
+            return entries
+        addr0 = flat_addrs[0]
+        base = (
+            addr0 if str(addr0).startswith("http")
+            else f"http://{addr0}"
+        )
+        for nm in names:
+            try:
+                resp = _v28_requests.post(
+                    f"{base}/get_weights_by_parameter_name",
+                    json={
+                        "name": nm,
+                        "truncate_size": truncate_size,
+                    },
+                    timeout=15,
+                    proxies={"http": None, "https": None},
+                )
+                body = resp.text[:400]
+                first8 = None
+                dtype = None
+                try:
+                    _j = resp.json()
+                    if isinstance(_j, list):
+                        first8 = _j[:8]
+                    elif isinstance(_j, dict):
+                        first8 = (
+                            _j.get("values")
+                            or _j.get("first8")
+                        )
+                        dtype = _j.get("dtype")
+                except Exception:
+                    pass
+                entries.append({
+                    "name": nm,
+                    "status": resp.status_code,
+                    "first8": first8,
+                    "dtype": dtype,
+                    "body": body,
+                })
+            except Exception as _e_http:
+                entries.append({
+                    "name": nm,
+                    "status": -1,
+                    "first8": None,
+                    "dtype": None,
+                    "body": f"err: {_e_http}",
+                })
+        return entries
 
     def set_version(self, version: int) -> None:
         with self._version_lock:
