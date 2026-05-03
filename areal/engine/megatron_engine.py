@@ -201,7 +201,6 @@ class MegatronEngine(TrainEngine):
                     "v16:MTPSerializeFp32Upcast(AREAL_MTP_FP32_BROADCAST)",
                     "v17:MTPNativeAutoScaler+ConsumerBypass"
                     "(AREAL_MTP_NATIVE_AUTOSCALER,autograd_in_graph)",
-                    "v20:SpecDecDiag(D01-D14 full pipeline instrumentation)",
                     "v21:MTPFp32MasterRead+DefaultsOn"
                     "(AREAL_MTP_FP32_MASTER_READ,AREAL_MTP_FP32_BROADCAST=1)",
                     "v22:CollectiveDeadlockFix+PreScan+EarlyFlush",
@@ -220,9 +219,9 @@ class MegatronEngine(TrainEngine):
                         _os_banner.environ.get(
                             "AREAL_MTP_FP32_MASTER_READ", "1"),
                 }
-                # [MTPVersionBanner-v26] Added iter14 instrumentation: MTPSerializeSendMTP-v26 / MTPGradProbe-v26 / SGLangReadBackMTP-v26.
+                # [MTPVersionBanner-v27] Added iter14 instrumentation: MTPSerializeSendMTP-v26 / MTPGradProbe-v26 / SGLangReadBackMTP-v26.
                 self.logger.info(
-                    "[MTPVersionBanner-v26] tags=%s flags=%s",
+                    "[MTPVersionBanner-v27] tags=%s flags=%s",
                     ",".join(_banner_tags), _banner_flags,
                 )
                 try:
@@ -1222,110 +1221,158 @@ class MegatronEngine(TrainEngine):
                 "[SpecDecDiag-v20 D10] snapshot failed: %s", _e_d10,
             )
 
-        with trace_scope("megatron_engine.step"):
-            # [MTPGradProbe-v26] Install post-accumulate-grad hook on MTP
-            # params (once) so grads are captured at the moment they land,
-            # BEFORE Megatron's DistributedOptimizer consumes and frees them.
-            try:
-                if not getattr(self, "_mtp_gradhook_v26_installed", False):
-                    self._mtp_gradhook_v26_cache = {}
-                    _v26_inst = 0
-                    for _v26_m in self.model:
-                        for _v26_n, _v26_p in _v26_m.named_parameters():
-                            if (
-                                (".mtp_layers." in _v26_n
-                                 or ".mtp." in _v26_n
-                                 or ".enorm" in _v26_n
-                                 or ".hnorm" in _v26_n
-                                 or ".eh_proj" in _v26_n)
-                                and _v26_p.requires_grad
-                            ):
-                                def _mk_hook(_nm):
-                                    def _hook(_p):
-                                        try:
-                                            if _p.grad is not None:
-                                                self._mtp_gradhook_v26_cache[_nm] = (
-                                                    float(_p.grad.abs().mean().item()),
-                                                    float(_p.grad.abs().max().item()),
-                                                    str(_p.grad.dtype),
-                                                )
-                                        except Exception:
-                                            pass
-                                    return _hook
-                                try:
-                                    _v26_p.register_post_accumulate_grad_hook(
-                                        _mk_hook(_v26_n)
-                                    )
-                                    _v26_inst += 1
-                                except Exception:
-                                    pass
-                    self._mtp_gradhook_v26_installed = True
-                    self.logger.info(
-                        "[MTPGradProbe-v26] installed post_accumulate_grad_hook "
-                        "on %d MTP params",
-                        _v26_inst,
-                    )
-                if getattr(self, "_mtp_gradhook_v26_cache", None):
-                    for _v26_nm, (_am, _mx, _dt) in (
-                        self._mtp_gradhook_v26_cache.items()
-                    ):
-                        self.logger.info(
-                            "[MTPGradProbe-v26] name=%s grad_abs_mean=%.3e "
-                            "grad_abs_max=%.3e grad_dtype=%s",
-                            _v26_nm, _am, _mx, _dt,
-                        )
-                    self._mtp_gradhook_v26_cache = {}
-            except Exception as _e_v26g:
-                self.logger.warning(
-                    "[MTPGradProbe-v26] outer error: %s", _e_v26g,
+        # [MTPGradProbe-v26] Install post-accumulate-grad hook on MTP
+        # params (once) so grads are captured at the moment they land,
+        # BEFORE Megatron's DistributedOptimizer consumes and frees them.
+        try:
+            if not getattr(self, "_mtp_gradhook_v26_installed", False):
+                self._mtp_gradhook_v26_cache = {}
+                _v26_inst = 0
+                for _v26_m in self.model:
+                    for _v26_n, _v26_p in _v26_m.named_parameters():
+                        if (
+                            (".mtp_layers." in _v26_n
+                             or ".mtp." in _v26_n
+                             or ".enorm" in _v26_n
+                             or ".hnorm" in _v26_n
+                             or ".eh_proj" in _v26_n)
+                            and _v26_p.requires_grad
+                        ):
+                            def _mk_hook(_nm):
+                                def _hook(_p):
+                                    try:
+                                        if _p.grad is not None:
+                                            self._mtp_gradhook_v26_cache[_nm] = (
+                                                float(_p.grad.abs().mean().item()),
+                                                float(_p.grad.abs().max().item()),
+                                                str(_p.grad.dtype),
+                                            )
+                                    except Exception:
+                                        pass
+                                return _hook
+                            try:
+                                _v26_p.register_post_accumulate_grad_hook(
+                                    _mk_hook(_v26_n)
+                                )
+                                _v26_inst += 1
+                            except Exception:
+                                pass
+                self._mtp_gradhook_v26_installed = True
+                self.logger.info(
+                    "[MTPGradProbe-v26] installed post_accumulate_grad_hook "
+                    "on %d MTP params",
+                    _v26_inst,
                 )
-            # [MTPGradProbe-v25] Diagnostic grad probe before optimizer.step().
-            try:
-                _v25_probe_seen = set()
-                if getattr(self, "model", None) is not None:
-                    for _v25_module in self.model:
-                        for _v25_name, _v25_p in _v25_module.named_parameters():
-                            if ".mtp." not in _v25_name:
-                                continue
-                            if _v25_name in _v25_probe_seen:
-                                continue
-                            _v25_probe_seen.add(_v25_name)
-                            _v25_mp = getattr(_v25_p, "main_param", None)
+            if getattr(self, "_mtp_gradhook_v26_cache", None):
+                for _v26_nm, (_am, _mx, _dt) in (
+                    self._mtp_gradhook_v26_cache.items()
+                ):
+                    self.logger.info(
+                        "[MTPGradProbe-v26] name=%s grad_abs_mean=%.3e "
+                        "grad_abs_max=%.3e grad_dtype=%s",
+                        _v26_nm, _am, _mx, _dt,
+                    )
+                self._mtp_gradhook_v26_cache = {}
+        except Exception as _e_v26g:
+            self.logger.warning(
+                "[MTPGradProbe-v26] outer error: %s", _e_v26g,
+            )
+        # [MTPMainGrad-v27] Log Megatron DistributedOptimizer's
+        # fp32 reduced gradient buffer (param.main_grad) just before
+        # optimizer.step().  This is the ACTUAL gradient the optimizer
+        # consumes (fp32, post-allreduce, post-inv-scale), not the raw
+        # bf16 .grad captured by the grad hook.  Comparing the two
+        # distinguishes "grad vanishes in backward" vs "grad vanishes
+        # in allreduce/scaling pipeline".
+        try:
+            for _v27_m in self.model:
+                for _v27_n, _v27_p in _v27_m.named_parameters():
+                    if not (
+                        ".mtp_layers." in _v27_n
+                        or ".mtp." in _v27_n
+                        or ".enorm" in _v27_n
+                        or ".hnorm" in _v27_n
+                        or ".eh_proj" in _v27_n
+                    ):
+                        continue
+                    try:
+                        _v27_mg = getattr(_v27_p, "main_grad", None)
+                        if _v27_mg is None:
                             self.logger.info(
-                                "[MTPGradProbe-v25] name=%s has_grad=%s grad_dtype=%s grad.abs_mean=%.3e grad.abs_max=%.3e grad.nonzero_frac=%.3f main_param_dtype=%s main_param_abs_mean=%.3e",
-                                _v25_name, (_v25_p.grad is not None), str(_v25_p.grad.dtype if _v25_p.grad is not None else None),
-                                (_v25_p.grad.abs().mean().item() if _v25_p.grad is not None else float('nan')),
-                                (_v25_p.grad.abs().max().item() if _v25_p.grad is not None else float('nan')),
-                                ((_v25_p.grad != 0).float().mean().item() if _v25_p.grad is not None else float('nan')),
-                                str(_v25_mp.dtype if _v25_mp is not None else None),
-                                (_v25_mp.abs().mean().item() if _v25_mp is not None else float('nan'))
+                                "[MTPMainGrad-v27] name=%s main_grad=None "
+                                ".grad_is_none=%s",
+                                _v27_n, _v27_p.grad is None,
                             )
-            except Exception as _e:
-                self.logger.warning("[MTPGradProbe-v25] probe error: %s", _e)
+                        else:
+                            self.logger.info(
+                                "[MTPMainGrad-v27] name=%s dtype=%s "
+                                "shape=%s abs_mean=%.3e abs_max=%.3e "
+                                "nonzero_frac=%.3f",
+                                _v27_n, str(_v27_mg.dtype),
+                                tuple(_v27_mg.shape),
+                                float(_v27_mg.abs().mean().item()),
+                                float(_v27_mg.abs().max().item()),
+                                float(
+                                    (_v27_mg.abs() > 0).float().mean().item()
+                                ),
+                            )
+                    except Exception as _e_v27mg1:
+                        self.logger.info(
+                            "[MTPMainGrad-v27] name=%s probe_err=%s",
+                            _v27_n, _e_v27mg1,
+                        )
+        except Exception as _e_v27mg:
+            self.logger.warning(
+                "[MTPMainGrad-v27] outer error: %s", _e_v27mg,
+            )
+        # [MTPGradProbe-v25] Diagnostic grad probe before optimizer.step().
+        try:
+            _v25_probe_seen = set()
+            if getattr(self, "model", None) is not None:
+                for _v25_module in self.model:
+                    for _v25_name, _v25_p in _v25_module.named_parameters():
+                        if ".mtp." not in _v25_name:
+                            continue
+                        if _v25_name in _v25_probe_seen:
+                            continue
+                        _v25_probe_seen.add(_v25_name)
+                        _v25_mp = getattr(_v25_p, "main_param", None)
+                        self.logger.info(
+                            "[MTPGradProbe-v25] name=%s has_grad=%s grad_dtype=%s grad.abs_mean=%.3e grad.abs_max=%.3e grad.nonzero_frac=%.3f main_param_dtype=%s main_param_abs_mean=%.3e",
+                            _v25_name, (_v25_p.grad is not None), str(_v25_p.grad.dtype if _v25_p.grad is not None else None),
+                            (_v25_p.grad.abs().mean().item() if _v25_p.grad is not None else float('nan')),
+                            (_v25_p.grad.abs().max().item() if _v25_p.grad is not None else float('nan')),
+                            ((_v25_p.grad != 0).float().mean().item() if _v25_p.grad is not None else float('nan')),
+                            str(_v25_mp.dtype if _v25_mp is not None else None),
+                            (_v25_mp.abs().mean().item() if _v25_mp is not None else float('nan'))
+                        )
+        except Exception as _e:
+            self.logger.warning("[MTPGradProbe-v25] probe error: %s", _e)
+        with trace_scope("megatron_engine.step"):
             update_successful, grad_norm, _ = self.optimizer.step()
-            # [MTPPostOptim-v25] Diagnostic post-optimizer-step probe.
-            try:
-                _v25_post_seen = set()
-                if getattr(self, "model", None) is not None:
-                    for _v25_module in self.model:
-                        for _v25_name, _v25_p in _v25_module.named_parameters():
-                            if ".mtp." not in _v25_name:
-                                continue
-                            if _v25_name in _v25_post_seen:
-                                continue
-                            _v25_post_seen.add(_v25_name)
-                            _v25_mp = getattr(_v25_p, "main_param", None)
-                            self.logger.info(
-                                "[MTPPostOptim-v25] name=%s main_param_abs_mean_post=%.6e bf16_model_abs_mean=%.6e "
-                                "cast_diff_l1=%.3e cast_diff_linf=%.3e",
-                                _v25_name,
-                                (_v25_mp.abs().mean().item() if _v25_mp is not None else float('nan')),
-                                _v25_p.data.abs().mean().item(),
-                                ((_v25_mp.to(_v25_p.dtype) - _v25_p.data).abs().mean().item() if _v25_mp is not None else float('nan')),
-                                ((_v25_mp.to(_v25_p.dtype) - _v25_p.data).abs().max().item() if _v25_mp is not None else float('nan')),
-                            )
-            except Exception as _e:
-                self.logger.warning("[MTPPostOptim-v25] probe error: %s", _e)
+        # [MTPPostOptim-v25] Diagnostic post-optimizer-step probe.
+        try:
+            _v25_post_seen = set()
+            if getattr(self, "model", None) is not None:
+                for _v25_module in self.model:
+                    for _v25_name, _v25_p in _v25_module.named_parameters():
+                        if ".mtp." not in _v25_name:
+                            continue
+                        if _v25_name in _v25_post_seen:
+                            continue
+                        _v25_post_seen.add(_v25_name)
+                        _v25_mp = getattr(_v25_p, "main_param", None)
+                        self.logger.info(
+                            "[MTPPostOptim-v25] name=%s main_param_abs_mean_post=%.6e bf16_model_abs_mean=%.6e "
+                            "cast_diff_l1=%.3e cast_diff_linf=%.3e",
+                            _v25_name,
+                            (_v25_mp.abs().mean().item() if _v25_mp is not None else float('nan')),
+                            _v25_p.data.abs().mean().item(),
+                            ((_v25_mp.to(_v25_p.dtype) - _v25_p.data).abs().mean().item() if _v25_mp is not None else float('nan')),
+                            ((_v25_mp.to(_v25_p.dtype) - _v25_p.data).abs().max().item() if _v25_mp is not None else float('nan')),
+                        )
+        except Exception as _e:
+            self.logger.warning("[MTPPostOptim-v25] probe error: %s", _e)
 
         # [SpecDecDiag-v20 D11] post-step |deltaW| per MTP tensor.
         try:
@@ -4156,6 +4203,38 @@ class MegatronEngine(TrainEngine):
                         self._mtp_d15_prev_abs_mean[_hf_nm_d15] = (
                             _am_d15
                         )
+                        # [MTPFp32Delta-v27] Track fp32 master abs_mean delta
+                        # between consecutive MTP sync events.  Combined with
+                        # MTPBf16Drift-v25, makes it possible to compare
+                        # "fp32 per-step update" vs "bf16 ULP" directly.
+                        try:
+                            if not hasattr(self, "_mtp_v27_fp32_prev"):
+                                self._mtp_v27_fp32_prev = {}
+                            _v27_fp32_am = float(
+                                _hf_tn_d15.float().abs().mean().item()
+                            )
+                            _v27_prev = self._mtp_v27_fp32_prev.get(
+                                _hf_nm_d15
+                            )
+                            _v27_delta = (
+                                None if _v27_prev is None
+                                else _v27_fp32_am - _v27_prev
+                            )
+                            self._mtp_v27_fp32_prev[_hf_nm_d15] = (
+                                _v27_fp32_am
+                            )
+                            self.logger.info(
+                                "[MTPFp32Delta-v27] hf=%s "
+                                "fp32_abs_mean=%.9e delta=%s",
+                                _hf_nm_d15, _v27_fp32_am,
+                                ("%+0.3e" % _v27_delta)
+                                if _v27_delta is not None else "n/a",
+                            )
+                        except Exception as _e_v27fd:
+                            self.logger.warning(
+                                "[MTPFp32Delta-v27] err hf=%s: %s",
+                                _hf_nm_d15, _e_v27fd,
+                            )
                         # [MTPBf16Drift-v25] fp32 vs bf16-cast drift.
                         try:
                             import torch as _torch_v25d
@@ -4569,48 +4648,69 @@ class MegatronEngine(TrainEngine):
                     serialized_payload=serialized_payload,
                     flush_cache=True,
                 )
-                # Read back MTP LayerNorm weights
-                # from the SGLang draft model to verify what bytes the
-                # speculative decoder actually holds.  This closes the
-                # loop: trainer -> serialize -> SGLang.
+                # [SGLangReadBackMTPv2-v27] Read back MTP LayerNorm weights
+                # from the SGLang draft model over HTTP directly.
+                # iter14 used Python attribute access (missing on
+                # RemoteSGLangEngine). SGLang exposes
+                # /get_weights_by_parameter_name endpoint (introduced
+                # for verl/slime) which accepts JSON {name, truncate_size}.
                 try:
-                    if hasattr(
-                        self.rollout_engine, "get_weights_by_parameter_name"
-                    ):
-                        _v26_probe_names = [
+                    import requests as _v27_requests
+                    _v27_addrs = None
+                    try:
+                        _v27_inner = getattr(
+                            self.rollout_engine, "_engine", None
+                        )
+                        _v27_addrs = getattr(_v27_inner, "addresses", None)
+                    except Exception:
+                        _v27_addrs = None
+                    if _v27_addrs:
+                        _v27_probe = [
                             "model.mtp_layers.0.token_layernorm.weight",
                             "model.mtp_layers.0.hidden_layernorm.weight",
                             "model.mtp_layers.0.input_layernorm.weight",
                             "model.mtp_layers.0.post_attention_layernorm.weight",
                             "model.mtp_layers.0.final_layernorm.weight",
                         ]
-                        for _v26_pn in _v26_probe_names:
+                        _v27_addr0 = _v27_addrs[0]
+                        _v27_base = (
+                            _v27_addr0 if _v27_addr0.startswith("http")
+                            else f"http://{_v27_addr0}"
+                        )
+                        for _v27_nm in _v27_probe:
                             try:
-                                _v26_rb = (
-                                    self.rollout_engine
-                                    .get_weights_by_parameter_name(
-                                        _v26_pn, truncate_size=8,
-                                    )
+                                _v27_resp = _v27_requests.post(
+                                    f"{_v27_base}/get_weights_by_parameter_name",
+                                    json={
+                                        "name": _v27_nm,
+                                        "truncate_size": 8,
+                                    },
+                                    timeout=15,
                                 )
+                                _v27_body = _v27_resp.text[:400]
                                 self.logger.info(
-                                    "[SGLangReadBackMTP-v26] name=%s first8=%s",
-                                    _v26_pn, _v26_rb,
+                                    "[SGLangReadBackMTPv2-v27] name=%s "
+                                    "status=%s body=%s",
+                                    _v27_nm, _v27_resp.status_code,
+                                    _v27_body,
                                 )
-                            except Exception as _e_v26rb1:
+                            except Exception as _e_v27rb1:
                                 self.logger.info(
-                                    "[SGLangReadBackMTP-v26] name=%s "
-                                    "readback_unavailable err=%s",
-                                    _v26_pn, _e_v26rb1,
+                                    "[SGLangReadBackMTPv2-v27] name=%s "
+                                    "http_err=%s", _v27_nm, _e_v27rb1,
                                 )
                     else:
                         self.logger.info(
-                            "[SGLangReadBackMTP-v26] rollout_engine lacks "
-                            "get_weights_by_parameter_name; cannot read back."
+                            "[SGLangReadBackMTPv2-v27] addresses unavailable; "
+                            "cannot read back (inner_engine=%s).",
+                            type(
+                                getattr(self.rollout_engine, "_engine", None)
+                            ).__name__,
                         )
-                except Exception as _e_v26rb:
+                except Exception as _e_v27rb:
                     self.logger.warning(
-                        "[SGLangReadBackMTP-v26] outer error: %s",
-                        _e_v26rb,
+                        "[SGLangReadBackMTPv2-v27] outer error: %s",
+                        _e_v27rb,
                     )
                 _t_call1 = _time.time()
                 self.logger.info(
