@@ -220,8 +220,9 @@ class MegatronEngine(TrainEngine):
                         _os_banner.environ.get(
                             "AREAL_MTP_FP32_MASTER_READ", "1"),
                 }
+                # [MTPVersionBanner-v26] Added iter14 instrumentation: MTPSerializeSendMTP-v26 / MTPGradProbe-v26 / SGLangReadBackMTP-v26.
                 self.logger.info(
-                    "[MTPVersionBanner] tags=%s flags=%s",
+                    "[MTPVersionBanner-v26] tags=%s flags=%s",
                     ",".join(_banner_tags), _banner_flags,
                 )
                 try:
@@ -1222,6 +1223,62 @@ class MegatronEngine(TrainEngine):
             )
 
         with trace_scope("megatron_engine.step"):
+            # [MTPGradProbe-v26] Install post-accumulate-grad hook on MTP
+            # params (once) so grads are captured at the moment they land,
+            # BEFORE Megatron's DistributedOptimizer consumes and frees them.
+            try:
+                if not getattr(self, "_mtp_gradhook_v26_installed", False):
+                    self._mtp_gradhook_v26_cache = {}
+                    _v26_inst = 0
+                    for _v26_m in self.model:
+                        for _v26_n, _v26_p in _v26_m.named_parameters():
+                            if (
+                                (".mtp_layers." in _v26_n
+                                 or ".mtp." in _v26_n
+                                 or ".enorm" in _v26_n
+                                 or ".hnorm" in _v26_n
+                                 or ".eh_proj" in _v26_n)
+                                and _v26_p.requires_grad
+                            ):
+                                def _mk_hook(_nm):
+                                    def _hook(_p):
+                                        try:
+                                            if _p.grad is not None:
+                                                self._mtp_gradhook_v26_cache[_nm] = (
+                                                    float(_p.grad.abs().mean().item()),
+                                                    float(_p.grad.abs().max().item()),
+                                                    str(_p.grad.dtype),
+                                                )
+                                        except Exception:
+                                            pass
+                                    return _hook
+                                try:
+                                    _v26_p.register_post_accumulate_grad_hook(
+                                        _mk_hook(_v26_n)
+                                    )
+                                    _v26_inst += 1
+                                except Exception:
+                                    pass
+                    self._mtp_gradhook_v26_installed = True
+                    self.logger.info(
+                        "[MTPGradProbe-v26] installed post_accumulate_grad_hook "
+                        "on %d MTP params",
+                        _v26_inst,
+                    )
+                if getattr(self, "_mtp_gradhook_v26_cache", None):
+                    for _v26_nm, (_am, _mx, _dt) in (
+                        self._mtp_gradhook_v26_cache.items()
+                    ):
+                        self.logger.info(
+                            "[MTPGradProbe-v26] name=%s grad_abs_mean=%.3e "
+                            "grad_abs_max=%.3e grad_dtype=%s",
+                            _v26_nm, _am, _mx, _dt,
+                        )
+                    self._mtp_gradhook_v26_cache = {}
+            except Exception as _e_v26g:
+                self.logger.warning(
+                    "[MTPGradProbe-v26] outer error: %s", _e_v26g,
+                )
             # [MTPGradProbe-v25] Diagnostic grad probe before optimizer.step().
             try:
                 _v25_probe_seen = set()
@@ -3340,6 +3397,32 @@ class MegatronEngine(TrainEngine):
             f"tensor_dtypes={_tensor_dtypes}, "
             f"tensor_sizes_bytes={_tensor_sizes}"
         )
+        # [MTPSerializeSendMTP-v26] Sample first 8 values of each MTP
+        # tensor so we can prove the actual bytes placed into the
+        # SGLang IPC payload. The earlier MTPSendPreBcast-v25 probe
+        # was installed on the /update_weights_from_distributed bucket
+        # path which MTP tensors bypass — explaining 0 events in log.7.
+        try:
+            for _v26_name, _v26_t in mtp_hf_tensors:
+                try:
+                    _v26_first8 = [
+                        float(x) for x in _v26_t.flatten()[:8].tolist()
+                    ]
+                except Exception:
+                    _v26_first8 = []
+                self.logger.info(
+                    "[MTPSerializeSendMTP-v26] name=%s dtype=%s shape=%s "
+                    "abs_mean=%.6e abs_max=%.6e first8=%s",
+                    _v26_name, str(_v26_t.dtype), tuple(_v26_t.shape),
+                    float(_v26_t.abs().mean().item()),
+                    float(_v26_t.abs().max().item()),
+                    _v26_first8,
+                )
+        except Exception as _e_v26s:
+            self.logger.warning(
+                "[MTPSerializeSendMTP-v26] probe error: %s", _e_v26s,
+            )
+
 
         # -------------------------------------------------------------------
         # GPU -> CPU copy on a *dedicated CUDA stream* that is insulated
@@ -4486,6 +4569,49 @@ class MegatronEngine(TrainEngine):
                     serialized_payload=serialized_payload,
                     flush_cache=True,
                 )
+                # Read back MTP LayerNorm weights
+                # from the SGLang draft model to verify what bytes the
+                # speculative decoder actually holds.  This closes the
+                # loop: trainer -> serialize -> SGLang.
+                try:
+                    if hasattr(
+                        self.rollout_engine, "get_weights_by_parameter_name"
+                    ):
+                        _v26_probe_names = [
+                            "model.mtp_layers.0.token_layernorm.weight",
+                            "model.mtp_layers.0.hidden_layernorm.weight",
+                            "model.mtp_layers.0.input_layernorm.weight",
+                            "model.mtp_layers.0.post_attention_layernorm.weight",
+                            "model.mtp_layers.0.final_layernorm.weight",
+                        ]
+                        for _v26_pn in _v26_probe_names:
+                            try:
+                                _v26_rb = (
+                                    self.rollout_engine
+                                    .get_weights_by_parameter_name(
+                                        _v26_pn, truncate_size=8,
+                                    )
+                                )
+                                self.logger.info(
+                                    "[SGLangReadBackMTP-v26] name=%s first8=%s",
+                                    _v26_pn, _v26_rb,
+                                )
+                            except Exception as _e_v26rb1:
+                                self.logger.info(
+                                    "[SGLangReadBackMTP-v26] name=%s "
+                                    "readback_unavailable err=%s",
+                                    _v26_pn, _e_v26rb1,
+                                )
+                    else:
+                        self.logger.info(
+                            "[SGLangReadBackMTP-v26] rollout_engine lacks "
+                            "get_weights_by_parameter_name; cannot read back."
+                        )
+                except Exception as _e_v26rb:
+                    self.logger.warning(
+                        "[SGLangReadBackMTP-v26] outer error: %s",
+                        _e_v26rb,
+                    )
                 _t_call1 = _time.time()
                 self.logger.info(
                     f"[DiagUW] Successfully updated EAGLE draft model "
