@@ -4295,6 +4295,19 @@ class MegatronEngine(TrainEngine):
                     except Exception:
                         _sd_on = True
                     if _sd_on:
+                        # [v34] Defensive torch import: v28 SigmaDelta
+                        # block references _torch_v16 but the original
+                        # import was placed inside the v16 upcast
+                        # guard `if _v16_on:`. When the operator runs
+                        # with AREAL_MTP_FP32_BROADCAST=0 (or unset,
+                        # default "0"), _torch_v16 is undefined and
+                        # the Σ-Δ path raises NameError at
+                        # `_tn_sd.dtype != _torch_v16.float32` during
+                        # update_weights, aborting training. Importing
+                        # torch here is always-safe (module cache)
+                        # and restores Σ-Δ independence from the v16
+                        # env gate.
+                        import torch as _torch_v16
                         if not hasattr(self, "_mtp_sd_residual"):
                             self._mtp_sd_residual = {}
                         if not hasattr(self, "_mtp_sd_sync_idx"):

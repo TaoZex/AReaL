@@ -744,37 +744,44 @@ class RolloutController:
             except Exception as e:
                 return jsonify({"error": str(e)}), 500
 
-        # [v32] /callback/get_mtp_weight_norm -- DEPRECATED in v33.
-        # SGLang MiMo does not expose /get_weights_by_name; the
-        # endpoint always returns {"error": "sglang status=404"}.
-        # Replaced by /callback/get_mtp_probe (deterministic
-        # inference probe).  Kept as a 200+error stub so old
-        # MegatronEngine code does not crash on missing route.
+        # [v32] /callback/get_mtp_weight_norm (DEPRECATED STUB)
+        # ------------------------------------------------------------
+        # v32 attempted to read MTP weights back from sglang via
+        # /get_weights_by_name, but MiMoForCausalLM does not override
+        # get_weights_by_name and the scheduler routes the call to
+        # tp_worker (target), not draft_worker (where MTP layers
+        # actually live). Architecturally unfixable from our side.
+        # Kept as a 200-stub so older training images calling the old
+        # route get a deterministic "deprecated" signal rather than
+        # a 404-wrapped-as-500.
         @app.route("/callback/get_mtp_weight_norm", methods=["POST"])
         def get_mtp_weight_norm():
             return jsonify(
-                {"error": "deprecated-v33", "server": None}
+                {"error": "deprecated_v32_route_use_get_mtp_probe"}
             ), 200
 
         # ------------------------------------------------------------
         # [v33] /callback/get_mtp_probe
         # ------------------------------------------------------------
-        # Deterministic inference probe: sends a fixed prompt to
+        # Deterministic inference probe. Posts /generate to
         # server_infos[0] with temperature=0, top_p=1, top_k=1,
-        # max_new_tokens=1, return_logprob=1 and returns the first
-        # input_token_logprob.  This is a functional end-to-end
-        # check: if the draft model's logprobs change across weight
-        # syncs, the weights are actually being used by the
-        # speculative decoder.
+        # max_new_tokens=1, return_logprob=1 on a fixed prompt, and
+        # returns the first input_token_logprob as a float.
+        #
+        # Payload: {"version": <int>}
+        # Response: {"version": <int>, "logprob": <float>,
+        #            "server": <host:port>, "prompt": <str>}
         @app.route("/callback/get_mtp_probe", methods=["POST"])
         def get_mtp_probe():
             payload = request.get_json() or {}
-            _version = payload.get("version", -1)
+            _version = payload.get("version")
             _srv = None
+            _prompt_v33 = "The answer is"
             try:
                 if not self.server_infos:
                     return jsonify(
                         {"error": "no server_infos",
+                         "version": _version,
                          "server": None}
                     ), 200
                 _s0 = self.server_infos[0]
@@ -784,78 +791,83 @@ class RolloutController:
                 except Exception as _e_imp:
                     return jsonify(
                         {"error": f"import fail: {_e_imp!r}",
+                         "version": _version,
                          "server": _srv}
                     ), 200
                 _url = f"http://{_srv}/generate"
-                _probe_text = "The answer is"
+                _req = {
+                    "text": _prompt_v33,
+                    "sampling_params": {
+                        "temperature": 0.0,
+                        "top_p": 1.0,
+                        "top_k": 1,
+                        "max_new_tokens": 1,
+                    },
+                    "return_logprob": True,
+                    "logprob_start_len": 0,
+                }
                 try:
                     _r = _rq_v33c.post(
-                        _url,
-                        json={
-                            "text": _probe_text,
-                            "sampling_params": {
-                                "temperature": 0,
-                                "top_p": 1,
-                                "top_k": 1,
-                                "max_new_tokens": 1,
-                            },
-                            "return_logprob": True,
-                        },
-                        timeout=60.0,
+                        _url, json=_req, timeout=60.0,
                         proxies={"http": None, "https": None},
                     )
                 except Exception as _e_http:
                     return jsonify(
-                        {
-                            "error": f"http fail: {_e_http!r}",
-                            "server": _srv,
-                        }
+                        {"error": f"http fail: {_e_http!r}",
+                         "version": _version,
+                         "server": _srv, "url": _url}
                     ), 200
                 if _r.status_code != 200:
                     return jsonify(
-                        {
-                            "error": f"sglang status={_r.status_code}",
-                            "server": _srv,
-                            "body": _r.text[:400],
-                        }
+                        {"error": f"sglang status={_r.status_code}",
+                         "version": _version,
+                         "server": _srv, "url": _url,
+                         "body": _r.text[:400]}
                     ), 200
                 try:
                     _j = _r.json()
                 except Exception as _e_js:
                     return jsonify(
-                        {
-                            "error": f"json fail: {_e_js!r}",
-                            "server": _srv,
-                        }
+                        {"error": f"json fail: {_e_js!r}",
+                         "version": _version,
+                         "server": _srv}
                     ), 200
-                _logprob = None
-                try:
-                    _meta_out = _j.get("meta_info", {})
-                    _lp_list = _meta_out.get("input_token_logprobs", [])
-                    if _lp_list:
-                        _logprob = _lp_list[0]
-                        if isinstance(_logprob, list):
-                            _logprob = _logprob[0]
-                        elif isinstance(_logprob, dict):
-                            _logprob = _logprob.get(
-                                "logprob",
-                                _logprob.get("prob", None),
-                            )
-                except Exception:
-                    pass
+                _item = _j if isinstance(_j, dict) else (
+                    _j[0] if isinstance(_j, list) and _j else {}
+                )
+                _meta = _item.get("meta_info", {}) if isinstance(_item, dict) else {}
+                _itl = _meta.get("input_token_logprobs", None)
+                _lp = None
+                if isinstance(_itl, list) and _itl:
+                    for _e in _itl:
+                        if isinstance(_e, (list, tuple)) and _e:
+                            _cand = _e[0]
+                            if isinstance(_cand, (int, float)):
+                                _lp = float(_cand)
+                                break
+                        elif isinstance(_e, (int, float)):
+                            _lp = float(_e)
+                            break
+                if _lp is None:
+                    return jsonify(
+                        {"error": "no_input_token_logprob",
+                         "version": _version,
+                         "server": _srv,
+                         "meta_keys": list(_meta.keys()) if isinstance(_meta, dict) else None}
+                    ), 200
                 return jsonify(
-                    {
-                        "version": _version,
-                        "logprob": _logprob,
-                        "server": _srv,
-                    }
+                    {"version": _version,
+                     "logprob": _lp,
+                     "server": _srv,
+                     "prompt": _prompt_v33}
                 ), 200
             except Exception as _e:
                 logger.warning(
                     f"[v33] get_mtp_probe unexpected: {_e!r}"
                 )
                 return jsonify(
-                    {"error": repr(_e), "server": _srv}
+                    {"error": repr(_e), "version": _version,
+                     "server": _srv}
                 ), 200
 
         @app.errorhandler(Exception)
