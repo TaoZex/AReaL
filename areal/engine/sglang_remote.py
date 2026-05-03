@@ -137,6 +137,28 @@ class SGLangBackend:
                         f"completion_tokens="
                         f"{meta_info.get('completion_tokens', 'n/a')}"
                     )
+                # [SpecDecDiag-v20 D03+] Accept-rate EMA on class instance.
+                try:
+                    rate = accept_rate
+                    if not hasattr(self, '_spec_dec_ema_short'):
+                        self._spec_dec_ema_short = rate
+                        self._spec_dec_ema_long = rate
+                        self._spec_dec_rate_count = 1
+                        self._spec_dec_rate_sum = rate
+                    else:
+                        alpha_s = 2.0 / (64 + 1)
+                        alpha_l = 2.0 / (256 + 1)
+                        self._spec_dec_ema_short = alpha_s * rate + (1 - alpha_s) * self._spec_dec_ema_short
+                        self._spec_dec_ema_long = alpha_l * rate + (1 - alpha_l) * self._spec_dec_ema_long
+                        self._spec_dec_rate_count += 1
+                        self._spec_dec_rate_sum += rate
+                    logger.info(
+                        "[SpecDecDiag-v20 D03+] AcceptEMA: rate=%.4f ema64=%.4f ema256=%.4f global_n=%d global_avg=%.4f",
+                        rate, self._spec_dec_ema_short, self._spec_dec_ema_long,
+                        self._spec_dec_rate_count, self._spec_dec_rate_sum / self._spec_dec_rate_count,
+                    )
+                except Exception as _e:
+                    pass
         if stop_reason == "abort" and stop_message.startswith("Abort before prefill"):
             return HttpGenerationResult(
                 output_tokens=[],

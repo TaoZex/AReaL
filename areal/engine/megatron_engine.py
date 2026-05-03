@@ -207,6 +207,7 @@ class MegatronEngine(TrainEngine):
                     "v22:CollectiveDeadlockFix+PreScan+EarlyFlush",
                     "v23:NoDPCollective+TPConsensus+MainParamViewDirect",
                     "v24:TPDtypeSymmetric+NonPPHeadAlsoFp32",
+                    "v25:AcceptEMA+GradProbe+PostOptim+Bf16Drift+SendPreBcast",
                 ]
                 _banner_flags = {
                     "AREAL_MTP_FP32_BROADCAST":
@@ -1221,7 +1222,53 @@ class MegatronEngine(TrainEngine):
             )
 
         with trace_scope("megatron_engine.step"):
+            # [MTPGradProbe-v25] Diagnostic grad probe before optimizer.step().
+            try:
+                _v25_probe_seen = set()
+                if getattr(self, "model", None) is not None:
+                    for _v25_module in self.model:
+                        for _v25_name, _v25_p in _v25_module.named_parameters():
+                            if ".mtp." not in _v25_name:
+                                continue
+                            if _v25_name in _v25_probe_seen:
+                                continue
+                            _v25_probe_seen.add(_v25_name)
+                            _v25_mp = getattr(_v25_p, "main_param", None)
+                            self.logger.info(
+                                "[MTPGradProbe-v25] name=%s has_grad=%s grad_dtype=%s grad.abs_mean=%.3e grad.abs_max=%.3e grad.nonzero_frac=%.3f main_param_dtype=%s main_param_abs_mean=%.3e",
+                                _v25_name, (_v25_p.grad is not None), str(_v25_p.grad.dtype if _v25_p.grad is not None else None),
+                                (_v25_p.grad.abs().mean().item() if _v25_p.grad is not None else float('nan')),
+                                (_v25_p.grad.abs().max().item() if _v25_p.grad is not None else float('nan')),
+                                ((_v25_p.grad != 0).float().mean().item() if _v25_p.grad is not None else float('nan')),
+                                str(_v25_mp.dtype if _v25_mp is not None else None),
+                                (_v25_mp.abs().mean().item() if _v25_mp is not None else float('nan'))
+                            )
+            except Exception as _e:
+                self.logger.warning("[MTPGradProbe-v25] probe error: %s", _e)
             update_successful, grad_norm, _ = self.optimizer.step()
+            # [MTPPostOptim-v25] Diagnostic post-optimizer-step probe.
+            try:
+                _v25_post_seen = set()
+                if getattr(self, "model", None) is not None:
+                    for _v25_module in self.model:
+                        for _v25_name, _v25_p in _v25_module.named_parameters():
+                            if ".mtp." not in _v25_name:
+                                continue
+                            if _v25_name in _v25_post_seen:
+                                continue
+                            _v25_post_seen.add(_v25_name)
+                            _v25_mp = getattr(_v25_p, "main_param", None)
+                            self.logger.info(
+                                "[MTPPostOptim-v25] name=%s main_param_abs_mean_post=%.6e bf16_model_abs_mean=%.6e "
+                                "cast_diff_l1=%.3e cast_diff_linf=%.3e",
+                                _v25_name,
+                                (_v25_mp.abs().mean().item() if _v25_mp is not None else float('nan')),
+                                _v25_p.data.abs().mean().item(),
+                                ((_v25_mp.to(_v25_p.dtype) - _v25_p.data).abs().mean().item() if _v25_mp is not None else float('nan')),
+                                ((_v25_mp.to(_v25_p.dtype) - _v25_p.data).abs().max().item() if _v25_mp is not None else float('nan')),
+                            )
+            except Exception as _e:
+                self.logger.warning("[MTPPostOptim-v25] probe error: %s", _e)
 
         # [SpecDecDiag-v20 D11] post-step |deltaW| per MTP tensor.
         try:
@@ -2898,6 +2945,28 @@ class MegatronEngine(TrainEngine):
             f"n_tensors={len(converted_named_tensors)}, n_specs={len(param_specs)}, "
             f"names={[n for n, _ in converted_named_tensors[:5]]}..."
         )
+        # [MTPSendPreBcast-v25] Capture exact tensors to be broadcast.
+        try:
+            for _v25_name, _v25_t in converted_named_tensors:
+                if ("mtp_layers." in _v25_name or ".mtp." in _v25_name):
+                    try:
+                        _v25_first8 = [
+                            float(x) for x in _v25_t.flatten()[:8].tolist()
+                        ]
+                    except Exception:
+                        _v25_first8 = []
+                    self.logger.info(
+                        "[MTPSendPreBcast-v25] name=%s dtype=%s shape=%s "
+                        "abs_mean=%.6e abs_max=%.6e first8=%s",
+                        _v25_name, str(_v25_t.dtype), tuple(_v25_t.shape),
+                        _v25_t.abs().mean().item(),
+                        _v25_t.abs().max().item(),
+                        _v25_first8,
+                    )
+        except Exception as _e_v25s:
+            self.logger.warning(
+                "[MTPSendPreBcast-v25] probe error: %s", _e_v25s,
+            )
         _t_post0 = _diag_time.time()
         fut = self.rollout_engine.update_weights_from_distributed(meta, param_specs)
         self.logger.info(
@@ -3652,33 +3721,19 @@ class MegatronEngine(TrainEngine):
             if ".mtp." in name:
                 mtp_param_count += 1
                 mtp_param_bytes += param.numel() * param.element_size()
-                # [MTPFp32MasterRead-v24]  TPDtypeSymmetric path.
-                # Root cause of the iter10 hang: v22 issued a DP
-                # all_gather_into_tensor under `if _have_master`
-                # which is True only on the DP rank that *owns*
-                # the fp32 master (DistributedOptimizer assigns
-                # each param-bucket to ONE DP rank), so non-owning
-                # DP peers skipped the collective -> NCCL hang.
-                # PreScan-v22 proved shard_numel == full_numel
-                # on owning rank, i.e. main_param is ALREADY the
-                # full TP-shard. Therefore the DP all_gather is
-                # unnecessary and removed.
+                # [MTPFp32MasterRead-v24]  TP-dtype-symmetric path.
                 #
-                # TP-safety: DistributedOptimizer ownership is
-                # per-bucket by DP rank, so all TP peers of the
-                # owning DP rank share the same ownership status.
-                # A TP-group MIN all_reduce on the have_master
-                # bool provides a belt-and-braces sanity check.
+                # Root cause of v23 hang at eh_proj.weight:
+                #   rank 0 (pp-head,dp=0,tp=0): _collect_param(fp32)
+                #   rank 1 (non-pp,  dp=0,tp=1): _collect_param(bf16)
+                # _collect_param internally does TP all_gather_param;
+                # two TP peers feeding different dtypes -> NCCL hang.
                 #
-                # v24 change: ALL ranks (pp-head or not) call
-                # _collect_param with the SAME source tensor
-                # (fp32_full or bf16 param) so the TP
-                # all_gather_param inside _collect_param sees a
-                # consistent dtype across TP peers. v23 had a
-                # subtle bug: pp-head passed fp32 while non-pp
-                # passed bf16 -> dtype mismatch inside
-                # all_gather_param -> silent data corruption or
-                # NCCL dtype error.
+                # v24 uniformly builds _fp32_full on the owning DP
+                # rank regardless of pp-head status, and ALWAYS passes
+                # the SAME dtype tensor to _collect_param on every TP
+                # peer of that TP group.  Non-pp-head peer drops the
+                # returned collected tensor.
                 import os as _os_v24m
                 import sys as _sys_v24m
                 import torch as _torch_v24m
@@ -3698,7 +3753,6 @@ class MegatronEngine(TrainEngine):
                             and int(_mp_shard.numel())
                             == int(param.numel())
                         )
-                        # Fetch group handles (DP info only for log).
                         try:
                             _dp_group = mpu.get_data_parallel_group(
                                 with_context_parallel=True,
@@ -3719,10 +3773,12 @@ class MegatronEngine(TrainEngine):
                         )
                         self.logger.info(
                             "[MTPFp32MasterRead-v24 ENTER] rank=%d "
-                            "name=%s dp_ws=%d tp_ws=%d "
+                            "name=%s pp_head=%s dp_ws=%d tp_ws=%d "
                             "have_master_local=%s shard_numel=%s "
                             "need_numel=%d",
-                            dist.get_rank(), name, _dp_ws, _tp_ws,
+                            dist.get_rank(), name,
+                            str(_collect_mtp_for_draft),
+                            _dp_ws, _tp_ws,
                             str(_have_master_local),
                             (str(int(_mp_shard.numel()))
                                 if isinstance(
@@ -3740,9 +3796,8 @@ class MegatronEngine(TrainEngine):
                         except Exception:
                             pass
                         # TP-group MIN all_reduce on have_master bool.
-                        # All TP peers within the same TP group MUST
-                        # call this collective together (they do: we
-                        # are outside any `if _have_master` gate).
+                        # Runs on ALL TP peers (outside any gate), so
+                        # dtype-symmetric int32 tensors join.
                         _have_master_tp = _have_master_local
                         if _tp_group is not None and _tp_ws > 1:
                             _dev = (
@@ -3764,30 +3819,22 @@ class MegatronEngine(TrainEngine):
                                 ),
                                 group=_tp_group,
                             )
-                            _have_master_tp = bool(int(_hv.item()) == 1)
-                            if _have_master_tp != _have_master_local:
-                                self.logger.warning(
-                                    "[MTPFp32MasterRead-v24 "
-                                    "TP_CONSENSUS] rank=%d name=%s "
-                                    "local=%s consensus=%s; "
-                                    "falling back to bf16 on this "
-                                    "TP peer to keep _collect_param "
-                                    "symmetric.",
-                                    dist.get_rank(), name,
-                                    str(_have_master_local),
-                                    str(_have_master_tp),
-                                )
-                            else:
-                                self.logger.info(
-                                    "[MTPFp32MasterRead-v24 "
-                                    "TP_CONSENSUS] rank=%d name=%s "
-                                    "consensus=%s",
-                                    dist.get_rank(), name,
-                                    str(_have_master_tp),
-                                )
+                            _have_master_tp = bool(
+                                int(_hv.item()) == 1
+                            )
+                            self.logger.info(
+                                "[MTPFp32MasterRead-v24 "
+                                "TP_CONSENSUS] rank=%d name=%s "
+                                "local=%s consensus=%s",
+                                dist.get_rank(), name,
+                                str(_have_master_local),
+                                str(_have_master_tp),
+                            )
+                        # Build fp32_full ONLY if BOTH local and TP
+                        # consensus say yes. This way every TP peer
+                        # ends up with _fp32_full==None XOR fp32,
+                        # consistently across the TP group.
                         if _have_master_tp and _have_master_local:
-                            # Direct view: main_param is already the
-                            # full TP-shard (shard_numel==full_numel).
                             _fp32_full = (
                                 _mp_shard.view(param.shape)
                                 .contiguous()
@@ -3805,7 +3852,71 @@ class MegatronEngine(TrainEngine):
                                     param.partition_stride
                                 )
                             _src_tag = "fp32master"
+                        elif _have_master_tp and not _have_master_local:
+                            # Shouldn't happen by DistributedOpt
+                            # semantics, but guard: TP peer says yes,
+                            # we say no -> we MUST still produce fp32
+                            # tensor to stay dtype-symmetric. Allocate
+                            # a zero fp32 tensor of param.shape as a
+                            # placeholder; the gathered output will be
+                            # wrong on our slice but only the pp-head
+                            # rank consumes the gather output, and
+                            # the TP peer that DOES have master sends
+                            # the correct slice. Wait -- _collect_param
+                            # gathers every TP slice; if our slice is
+                            # zero that taints the gathered tensor.
+                            # In practice this branch is unreachable
+                            # given ownership; downgrade to bf16-all.
+                            self.logger.warning(
+                                "[MTPFp32MasterRead-v24 "
+                                "TP_CONSENSUS_ASYMM] rank=%d name=%s "
+                                "consensus=True local=False; falling "
+                                "back to bf16 on ENTIRE TP group to "
+                                "avoid tainting gathered slice.",
+                                dist.get_rank(), name,
+                            )
+                            _fp32_full = None
+                            _src_tag = "bf16model"
+                            # Propagate decision via a second tiny
+                            # all_reduce so the PEER sees it too.
+                            _force_bf16 = _torch_v24m.tensor(
+                                [1],
+                                dtype=_torch_v24m.int32,
+                                device=param.device,
+                            )
+                            _torch_v24m.distributed.all_reduce(
+                                _force_bf16,
+                                op=(
+                                    _torch_v24m.distributed
+                                    .ReduceOp.MAX
+                                ),
+                                group=_tp_group,
+                            )
                         else:
+                            # Both TP peers agree: no master.
+                            # Must also run the second all_reduce
+                            # so symmetry with the asymm branch is
+                            # maintained.
+                            _force_bf16 = _torch_v24m.tensor(
+                                [0],
+                                dtype=_torch_v24m.int32,
+                                device=param.device,
+                            )
+                            _torch_v24m.distributed.all_reduce(
+                                _force_bf16,
+                                op=(
+                                    _torch_v24m.distributed
+                                    .ReduceOp.MAX
+                                ),
+                                group=_tp_group,
+                            )
+                            if int(_force_bf16.item()) == 1:
+                                self.logger.warning(
+                                    "[MTPFp32MasterRead-v24 "
+                                    "TP_CONSENSUS_ASYMM] rank=%d "
+                                    "name=%s forced bf16 by peer.",
+                                    dist.get_rank(), name,
+                                )
                             if not getattr(
                                 self,
                                 "_mtp_master_read_missing_warned",
@@ -3824,10 +3935,13 @@ class MegatronEngine(TrainEngine):
                         if _fp32_full is not None:
                             self.logger.info(
                                 "[MTPFp32MasterRead-v24 D15a] "
-                                "rank=%d name=%s dp_ws=%d tp_ws=%d "
-                                "shape=%s fp32_abs_mean=%.6e "
+                                "rank=%d name=%s pp_head=%s "
+                                "dp_ws=%d tp_ws=%d shape=%s "
+                                "fp32_abs_mean=%.6e "
                                 "fp32_abs_max=%.6e (source=%s)",
-                                dist.get_rank(), name, _dp_ws, _tp_ws,
+                                dist.get_rank(), name,
+                                str(_collect_mtp_for_draft),
+                                _dp_ws, _tp_ws,
                                 tuple(_fp32_full.shape),
                                 float(_fp32_full.abs().mean().item()),
                                 float(_fp32_full.abs().max().item()),
@@ -3850,16 +3964,56 @@ class MegatronEngine(TrainEngine):
                         )
                         _fp32_full = None
                         _src_tag = "bf16model"
-                # v24: ALL ranks call _collect_param with the SAME
-                # source tensor (fp32_full or bf16 param) so the TP
-                # all_gather_param inside sees consistent dtype.
-                if _fp32_full is not None:
-                    _mtp_param, _ = self._collect_param(
-                        name, _fp32_full,
-                    )
-                else:
-                    _mtp_param, _ = self._collect_param(name, param)
-                if _collect_mtp_for_draft:
+                # === v24 key change ===
+                # Hand the SAME dtype tensor to _collect_param on
+                # every TP peer.  pp-head consumes the gathered
+                # tensor; non-pp-head drops it.
+                _collect_src = (
+                    _fp32_full if _fp32_full is not None else param
+                )
+                self.logger.info(
+                    "[MTPFp32MasterRead-v24 COLLECT_SRC] rank=%d "
+                    "name=%s pp_head=%s src_dtype=%s src_shape=%s "
+                    "src_tag=%s",
+                    dist.get_rank(), name,
+                    str(_collect_mtp_for_draft),
+                    str(_collect_src.dtype),
+                    tuple(_collect_src.shape),
+                    _src_tag,
+                )
+                try:
+                    for _h in list(self.logger.handlers):
+                        try:
+                            _h.flush()
+                        except Exception:
+                            pass
+                    _sys_v24m.stdout.flush()
+                except Exception:
+                    pass
+                _mtp_param, _ = self._collect_param(
+                    name, _collect_src,
+                )
+                self.logger.info(
+                    "[MTPFp32MasterRead-v24 COLLECT_DONE] rank=%d "
+                    "name=%s pp_head=%s returned_dtype=%s "
+                    "returned_shape=%s",
+                    dist.get_rank(), name,
+                    str(_collect_mtp_for_draft),
+                    (str(_mtp_param.dtype)
+                        if _mtp_param is not None else "None"),
+                    (tuple(_mtp_param.shape)
+                        if _mtp_param is not None else "None"),
+                )
+                try:
+                    for _h in list(self.logger.handlers):
+                        try:
+                            _h.flush()
+                        except Exception:
+                            pass
+                    _sys_v24m.stdout.flush()
+                except Exception:
+                    pass
+                if _collect_mtp_for_draft and _mtp_param is not None:
                     _mtp_model_name = self.hf_config.model_type
                     _prev_count = len(mtp_hf_tensors)
                     mtp_hf_tensors.extend(
@@ -3919,6 +4073,42 @@ class MegatronEngine(TrainEngine):
                         self._mtp_d15_prev_abs_mean[_hf_nm_d15] = (
                             _am_d15
                         )
+                        # [MTPBf16Drift-v25] fp32 vs bf16-cast drift.
+                        try:
+                            import torch as _torch_v25d
+                            _fp32_dtype = _hf_tn_d15.dtype
+                            _fp32_ref = _hf_tn_d15.float()
+                            _fp32_abs_mean = float(
+                                _fp32_ref.abs().mean().item()
+                            )
+                            try:
+                                _bf16_cast = _hf_tn_d15.to(
+                                    _torch_v25d.bfloat16
+                                ).float()
+                                _bf16_abs_mean = float(
+                                    _bf16_cast.abs().mean().item()
+                                )
+                                _diff = (_fp32_ref - _bf16_cast).abs()
+                                _diff_l1 = float(_diff.mean().item())
+                                _diff_linf = float(_diff.max().item())
+                            except Exception:
+                                _bf16_abs_mean = float('nan')
+                                _diff_l1 = float('nan')
+                                _diff_linf = float('nan')
+                            self.logger.info(
+                                "[MTPBf16Drift-v25] hf=%s "
+                                "fp32_abs_mean=%.6e bf16_abs_mean=%.6e "
+                                "cast_diff_l1=%.3e cast_diff_linf=%.3e "
+                                "fp32_dtype=%s",
+                                _hf_nm_d15, _fp32_abs_mean,
+                                _bf16_abs_mean, _diff_l1,
+                                _diff_linf, str(_fp32_dtype),
+                            )
+                        except Exception as _e_v25d:
+                            self.logger.warning(
+                                "[MTPBf16Drift-v25] error hf=%s: %s",
+                                _hf_nm_d15, _e_v25d,
+                            )
                         self.logger.info(
                             "[MTPWeightDeltaD15] hf=%s "
                             "abs_mean=%.9e delta=%s frozen=%s "
