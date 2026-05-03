@@ -207,6 +207,7 @@ class MegatronEngine(TrainEngine):
                     "v23:NoDPCollective+TPConsensus+MainParamViewDirect",
                     "v24:TPDtypeSymmetric+NonPPHeadAlsoFp32",
                     "v25:AcceptEMA+GradProbe+PostOptim+Bf16Drift+SendPreBcast",
+                    "v30:MTPRelativeSpeed+SignalAudit+ReadBackInternal(AREAL_MTP_V30_DIAG)",
                 ]
                 _banner_flags = {
                     "AREAL_MTP_FP32_BROADCAST":
@@ -218,6 +219,9 @@ class MegatronEngine(TrainEngine):
                     "AREAL_MTP_FP32_MASTER_READ":
                         _os_banner.environ.get(
                             "AREAL_MTP_FP32_MASTER_READ", "1"),
+                    "AREAL_MTP_V30_DIAG":
+                        _os_banner.environ.get(
+                            "AREAL_MTP_V30_DIAG", "1"),
                 }
                 # [MTPVersionBanner-v29] Added iter16 instrumentation: SGLangReadBackMTPv3-v28(CallbackPath) / MTPBf16ULPProof-v28.
                 _banner_tags = list(_banner_tags) + ["v27:SGLangReadBackMTPv2-HTTP+MainGrad+Fp32Delta", "v28:SGLangReadBackMTPv3-CallbackPath+MTPBf16ULPProof",
@@ -4483,6 +4487,225 @@ class MegatronEngine(TrainEngine):
             f"buffer_size={buffer_size}"
         )
 
+        # [MTPRelativeSpeed-v30] Collect fp32 master-weight snapshots
+        # for BOTH MTP-draft parameters AND a canonical backbone sample.
+        # Computed BEFORE the bf16 serialization/broadcast so the ratio
+        # reflects what actually moved in the optimizer master copy
+        # (i.e. Adam-driven signal, not bf16-rounded wire values).
+        #
+        # H1 (MTP relative speed too slow) is confirmed iff ratio <= 0.1
+        # persistently across weight syncs while accept_ema is declining.
+        # H1 is rejected if ratio >= 1.0 (MTP is updating at least as
+        # fast as the backbone in relative terms).
+        try:
+            import os as _os_v30
+            _v30_on = _os_v30.environ.get("AREAL_MTP_V30_DIAG", "1") == "1"
+        except Exception:
+            _v30_on = False
+        if _v30_on and mtp_hf_tensors:
+            try:
+                import torch as _torch_v30
+                # ---- Current MTP fp32 master norm (from optimizer) ----
+                _mtp_master_norm_sq = 0.0
+                _mtp_master_count = 0
+                _bb_master_norm_sq = 0.0
+                _bb_master_count = 0
+                for _n_v30, _p_v30 in get_named_parameters(
+                    self.model, num_moe_experts
+                ):
+                    if ".experts." in _n_v30:
+                        continue
+                    _data_v30 = getattr(_p_v30, "main_grad", None)
+                    # main_grad is the grad buffer; master weights sit in
+                    # _p_v30.data.float() for Megatron DistOpt. Use .data.
+                    _t_v30 = _p_v30.data
+                    if _t_v30 is None:
+                        continue
+                    _f_v30 = _t_v30.detach().float()
+                    _sq = float((_f_v30 * _f_v30).sum().item())
+                    _num = int(_f_v30.numel())
+                    if ".mtp." in _n_v30:
+                        _mtp_master_norm_sq += _sq
+                        _mtp_master_count += _num
+                    else:
+                        _bb_master_norm_sq += _sq
+                        _bb_master_count += _num
+                _mtp_master_norm = (_mtp_master_norm_sq ** 0.5)
+                _bb_master_norm = (_bb_master_norm_sq ** 0.5)
+                # ---- Delta vs previous sync ----
+                _prev_mtp = getattr(self, "_v30_prev_mtp_master_norm", None)
+                _prev_bb = getattr(self, "_v30_prev_bb_master_norm", None)
+                self._v30_prev_mtp_master_norm = _mtp_master_norm
+                self._v30_prev_bb_master_norm = _bb_master_norm
+                _rel_speed = None
+                _d_mtp_rel = None
+                _d_bb_rel = None
+                if _prev_mtp is not None and _prev_bb is not None:
+                    _d_mtp = abs(_mtp_master_norm - _prev_mtp)
+                    _d_bb = abs(_bb_master_norm - _prev_bb)
+                    if _mtp_master_norm > 0:
+                        _d_mtp_rel = _d_mtp / _mtp_master_norm
+                    if _bb_master_norm > 0:
+                        _d_bb_rel = _d_bb / _bb_master_norm
+                    if (
+                        _d_mtp_rel is not None
+                        and _d_bb_rel is not None
+                        and _d_bb_rel > 0
+                    ):
+                        _rel_speed = _d_mtp_rel / _d_bb_rel
+                try:
+                    _rank_v30 = (
+                        torch.distributed.get_rank()
+                        if torch.distributed.is_initialized() else 0
+                    )
+                except Exception:
+                    _rank_v30 = 0
+                if _rank_v30 == 0:
+                    self.logger.info(
+                        "[MTPRelativeSpeed-v30] version=%s "
+                        "|W_MTP|=%.4e (n=%d) |W_BB|=%.4e (n=%d) "
+                        "d|W_MTP|/|W_MTP|=%s d|W_BB|/|W_BB|=%s "
+                        "rel_speed=%s",
+                        str(meta.version),
+                        _mtp_master_norm, _mtp_master_count,
+                        _bb_master_norm, _bb_master_count,
+                        ("%.4e" % _d_mtp_rel) if _d_mtp_rel is not None else "NA",
+                        ("%.4e" % _d_bb_rel) if _d_bb_rel is not None else "NA",
+                        ("%.4f" % _rel_speed) if _rel_speed is not None else "NA",
+                    )
+                    # [MTPLossSignalAudit-v30] consolidate the signals
+                    # needed to arbitrate H1 vs H4 on a single line.
+                    _mtp_loss_ema = getattr(
+                        self, "_last_logged_mtp_loss_ema", None
+                    )
+                    _mtp_loss_raw = getattr(
+                        self, "_last_logged_mtp_loss_raw", None
+                    )
+                    _task_reward = getattr(
+                        self, "_last_logged_task_reward", None
+                    )
+                    _entropy_avg = getattr(
+                        self, "_last_logged_entropy_avg", None
+                    )
+                    _accept_ema = getattr(
+                        self, "_last_logged_accept_ema", None
+                    )
+                    self.logger.info(
+                        "[MTPLossSignalAudit-v30] version=%s "
+                        "rel_speed=%s mtp_loss_ema=%s mtp_loss_raw=%s "
+                        "task_reward=%s entropy_avg=%s accept_ema=%s "
+                        "H1=%s H4=%s",
+                        str(meta.version),
+                        ("%.4f" % _rel_speed) if _rel_speed is not None else "NA",
+                        ("%.4f" % _mtp_loss_ema) if isinstance(_mtp_loss_ema, (int, float)) else "NA",
+                        ("%.4f" % _mtp_loss_raw) if isinstance(_mtp_loss_raw, (int, float)) else "NA",
+                        ("%.4f" % _task_reward) if isinstance(_task_reward, (int, float)) else "NA",
+                        ("%.4f" % _entropy_avg) if isinstance(_entropy_avg, (int, float)) else "NA",
+                        ("%.4f" % _accept_ema) if isinstance(_accept_ema, (int, float)) else "NA",
+                        (
+                            "CONFIRMED" if (
+                                isinstance(_rel_speed, float)
+                                and _rel_speed <= 0.1
+                            ) else (
+                                "REJECTED" if (
+                                    isinstance(_rel_speed, float)
+                                    and _rel_speed >= 1.0
+                                ) else "UNKNOWN"
+                            )
+                        ),
+                        (
+                            "SUSPECT" if (
+                                isinstance(_task_reward, (int, float))
+                                and _task_reward >= 0.9
+                                and isinstance(_mtp_loss_ema, (int, float))
+                                and _mtp_loss_ema <= 0.6
+                            ) else "NORMAL"
+                        ),
+                    )
+            except Exception as _e_v30:
+                try:
+                    self.logger.warning(
+                        "[MTPRelativeSpeed-v30] computation failed: %r",
+                        _e_v30,
+                    )
+                except Exception:
+                    pass
+        # [SGLangReadBackMTPv4-v30] Best-effort internal-Python read-back
+        # of a single MTP tensor from SGLang workers, bypassing the HTTP
+        # /get_weights_by_parameter_name endpoint (which returns 404 on
+        # SGLang 0.5.9). If readback succeeds, the wire-side |W| is
+        # compared with the training-side |W| just serialized; mismatch
+        # >= 1e-3 indicates H2 (SGLang not receiving updates).
+        if _v30_on and mtp_hf_tensors:
+            try:
+                _re_v30 = self.rollout_engine
+                _inner = getattr(_re_v30, "_engine", None)
+                _inner2 = getattr(_inner, "_engine", None) if _inner is not None else None
+                _inner3 = getattr(_inner, "inner_engine", None) if _inner is not None else None
+                _callable_engine = None
+                for _cand in (_inner3, _inner2, _inner, _re_v30):
+                    if _cand is None:
+                        continue
+                    if hasattr(_cand, "get_weights_by_parameter_name"):
+                        _callable_engine = _cand
+                        break
+                try:
+                    _rank_rb = (
+                        torch.distributed.get_rank()
+                        if torch.distributed.is_initialized() else 0
+                    )
+                except Exception:
+                    _rank_rb = 0
+                if _rank_rb == 0:
+                    if _callable_engine is None:
+                        self.logger.info(
+                            "[SGLangReadBackMTPv4-v30] unavailable: "
+                            "no get_weights_by_parameter_name on "
+                            "rollout_engine chain (types=%s/%s/%s/%s)",
+                            type(_re_v30).__name__,
+                            type(_inner).__name__ if _inner is not None else "None",
+                            type(_inner2).__name__ if _inner2 is not None else "None",
+                            type(_inner3).__name__ if _inner3 is not None else "None",
+                        )
+                    else:
+                        _probe_name, _probe_tensor = mtp_hf_tensors[0]
+                        _expected_norm = float(
+                            _probe_tensor.detach().float().norm().item()
+                        )
+                        try:
+                            _wire = _callable_engine.get_weights_by_parameter_name(
+                                _probe_name
+                            )
+                            if hasattr(_wire, "float"):
+                                _wire_norm = float(_wire.float().norm().item())
+                            else:
+                                _wire_norm = float("nan")
+                            _gap = abs(_wire_norm - _expected_norm)
+                            _rel_gap = (
+                                _gap / max(_expected_norm, 1e-12)
+                            )
+                            self.logger.info(
+                                "[SGLangReadBackMTPv4-v30] name=%s "
+                                "expected_norm=%.6e wire_norm=%.6e "
+                                "rel_gap=%.4e H2=%s",
+                                _probe_name, _expected_norm, _wire_norm,
+                                _rel_gap,
+                                "CONFIRMED" if _rel_gap >= 1e-3 else "REJECTED",
+                            )
+                        except Exception as _e_rb:
+                            self.logger.info(
+                                "[SGLangReadBackMTPv4-v30] readback "
+                                "call failed: %r (engine=%s)",
+                                _e_rb, type(_callable_engine).__name__,
+                            )
+            except Exception as _e_rb_outer:
+                try:
+                    self.logger.warning(
+                        "[SGLangReadBackMTPv4-v30] outer failure: %r",
+                        _e_rb_outer,
+                    )
+                except Exception:
+                    pass
         if mtp_hf_tensors:
             # [v5-F3] Compute norms for ALL tensors (was: only first 5).
             # [v5-F5] Track prev norm per-tensor to surface drift direction
