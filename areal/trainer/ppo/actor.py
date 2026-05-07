@@ -143,6 +143,68 @@ class PPOActor:
             from areal.trainer.ppo.actor_r3_patch import _resolve_to_tensor
             _r3_routed_experts = _resolve_to_tensor(_r3_routed_experts)
         _r3_enabled = bool(getattr(self.engine, "_r3_enabled", False))
+        # ---- R3 valid-mask propagation into PPO loss_mask ------------
+        # SGLang does NOT record routing for the last generated token
+        # of each sequence (its routing metadata is finalised AFTER the
+        # forward pass that produces it).  Per-seq TP-alignment slack
+        # rows and batch-padding sequences are likewise unrecorded.
+        # ``set_router_replay_data`` marks every such row as "all-zero"
+        # via ``row_all_zero = (packed == 0).all(...)`` and the patched
+        # router (``_patched_topk_routing_with_score_function``) falls
+        # back to LIVE-router top-k for it.  Once optimizer steps move
+        # theta, those fallback tokens see a routing that diverges from
+        # rollout, which inflates the PPO ratio, ``rollout_train_k3_kl``
+        # and ``actor_loss`` even when every other token in the batch
+        # is faithfully replayed.
+        #
+        # Strike them out of the PPO loss (and of every downstream
+        # metric that consumes ``data["loss_mask"]``: GAE, approx_kl,
+        # rollout_train_k3_kl, importance ratio, ...).  ``routed_experts``
+        # is shaped ``(bs, seq_len, num_layers, topk)`` and is in the
+        # un-rolled frame -- exactly the same frame as
+        # ``data["loss_mask"]`` at this point -- so the AND is
+        # point-wise without any roll / shift.  A token row is "valid
+        # replay" iff at least one (layer, top-k) entry is non-zero,
+        # mirroring the strike rule used both inside
+        # ``set_router_replay_data`` and the equivalent fallback gate
+        # in ``_patched_topk_routing_with_score_function``.
+        if (
+            _r3_enabled
+            and isinstance(_r3_routed_experts, torch.Tensor)
+            and _r3_routed_experts.ndim >= 4
+            and isinstance(data.get("loss_mask"), torch.Tensor)
+        ):
+            with torch.no_grad():
+                _r3_recorded = (
+                    (_r3_routed_experts != 0).any(dim=-1).any(dim=-1)
+                )  # (bs, seq_len) bool
+                _lm = data["loss_mask"]
+                if _r3_recorded.shape == _lm.shape:
+                    _lm_dtype = _lm.dtype
+                    _lm_filtered = _lm.bool() & _r3_recorded.to(_lm.device)
+                    data["loss_mask"] = _lm_filtered.to(_lm_dtype)
+                    try:
+                        from areal.engine.router_replay_utils import (
+                            _r3_should_log,
+                            _r3_verbose,
+                        )
+                        if _r3_verbose() and _r3_should_log(
+                            "actor._compute_logp/loss_mask_r3_filter"
+                        ):
+                            _n_before = int(_lm.bool().sum().item())
+                            _n_after = int(_lm_filtered.sum().item())
+                            logger.info(
+                                "[R3-STAGE2/actor._compute_logp] "
+                                "LOSS_MASK_R3_FILTER kept=%d/%d dropped=%d "
+                                "(%.4f%%) bs=%d seq_len=%d",
+                                _n_after, _n_before,
+                                _n_before - _n_after,
+                                100.0 * (_n_before - _n_after)
+                                / max(_n_before, 1),
+                                _lm.shape[0], _lm.shape[1],
+                            )
+                    except Exception:
+                        pass
         try:
             from areal.engine.router_replay_utils import (
                 _r3_should_log,
