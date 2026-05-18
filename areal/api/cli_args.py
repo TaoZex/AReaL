@@ -929,6 +929,58 @@ class MegatronEngineConfig:
         },
     )
 
+    # ==================== MTP (Multi-Token Prediction) Online Training =========
+    # When `enable_mtp_training` is True, the Megatron training loop will:
+    #   1. Construct the GPTModel with the MTP block (mbridge does this
+    #      automatically when hf_config.num_nextn_predict_layers > 0).
+    #   2. On every training forward pass, also run an MTP CE loss whose
+    #      gradients only flow into the MTP layer parameters (the shared
+    #      output_weight is detached so MTP CE never pollutes embedding /
+    #      output_layer gradients).
+    #   3. Skip the MTP path during inference / log-prob / ref-logp passes.
+    # The newly-trained MTP weights are then automatically packaged into the
+    # weight-update bundle that is broadcast to SGLang's EAGLE draft worker.
+    enable_mtp_training: bool = field(
+        default=False,
+        metadata={
+            "help": "Enable online MTP head training. Requires the underlying "
+            "GPTModel to expose num_nextn_predict_layers / mtp_num_layers > 0."
+        },
+    )
+    mtp_num_layers: int | None = field(
+        default=None,
+        metadata={
+            "help": "Number of MTP layers. Required when enable_mtp_training "
+            "is True. Used both as a sanity check and to size the MTP head."
+        },
+    )
+    mtp_loss_scaling_factor: float = field(
+        default=0.2,
+        metadata={
+            "help": "Scaling factor applied to the MTP CE loss before adding "
+            "to the actor loss. Default 0.2."
+        },
+    )
+    enable_mtp_loss_logging: bool = field(
+        default=True,
+        metadata={
+            "help": "When True, the per-step MTP loss (DP-averaged) is "
+            "attached to the loss-stat dict under the 'mtp_loss' key, so it "
+            "is surfaced through wandb/tensorboard automatically."
+        },
+    )
+    # ==========================================================================
+
+    def __post_init__(self):
+        # Cross-field consistency check for MTP training.
+        if self.enable_mtp_training and (
+            self.mtp_num_layers is None or self.mtp_num_layers <= 0
+        ):
+            raise ValueError(
+                "[AReaL][MTP] enable_mtp_training=True requires "
+                "mtp_num_layers > 0 to be set explicitly."
+            )
+
 
 class SchedulingStrategyType(str, Enum):
     separation = "separation"
@@ -1805,6 +1857,64 @@ class SGLangConfig:
     # Internal field, not exposed to users.
     enable_return_routed_experts: bool = False
 
+    # ==================== Speculative Decoding (EAGLE / MTP) ====================
+    # When `speculative_algorithm` is set (e.g. "EAGLE"/"EAGLE3"), SGLang will
+    # launch with EAGLE-style speculative decoding. The corresponding CLI flags
+    # `--speculative-*` are forwarded to upstream SGLang via `get_py_cmd`.
+    # If `speculative_draft_model_path` is left empty, SGLang reuses MTP head(s)
+    # embedded in the target checkpoint (recommended path for online MTP
+    # training, where the draft weights are continuously synced from training).
+    speculative_algorithm: str | None = field(
+        default=None,
+        metadata={
+            "help": "Speculative decoding algorithm. e.g. 'EAGLE' / 'EAGLE3'. "
+            "When None, speculative decoding is disabled (original behavior).",
+        },
+    )
+    speculative_draft_model_path: str | None = field(
+        default=None,
+        metadata={
+            "help": "Path to the EAGLE draft model. Leave empty to reuse the "
+            "MTP heads packaged inside the target checkpoint."
+        },
+    )
+    speculative_num_steps: int = field(
+        default=3,
+        metadata={"help": "Number of forward steps the draft model takes per round."},
+    )
+    speculative_eagle_topk: int = field(
+        default=1,
+        metadata={"help": "Top-k candidates retained per draft step."},
+    )
+    speculative_num_draft_tokens: int = field(
+        default=4,
+        metadata={"help": "Number of draft tokens verified by the target per round."},
+    )
+    speculative_token_map: str | None = field(
+        default=None,
+        metadata={"help": "Optional FR-Spec token map path."},
+    )
+    # When True we always pass --enable-draft-weights-cpu-backup to SGLang.
+    # Required when `enable_memory_saver` (offload-rollout) is active so that
+    # the draft weights survive the target-model offload/wake cycle.
+    enable_draft_weights_cpu_backup: bool = field(
+        default=False,
+        metadata={
+            "help": "Force SGLang to keep a CPU backup of draft weights. "
+            "Auto-enabled when speculative_algorithm is set."
+        },
+    )
+    # When True the rollout coordinator collects per-sample EAGLE acceptance
+    # statistics (accept_length, accept_rate) and exposes them as scalar
+    # metrics on every rollout batch. No-op when speculative_algorithm is None.
+    enable_speculative_metrics: bool = field(
+        default=True,
+        metadata={
+            "help": "Aggregate per-sample EAGLE acceptance statistics on the "
+            "rollout side and surface them as scalar metrics."
+        },
+    )
+
     # Use staticmethod to make OmegaConf happy.
     @staticmethod
     def build_cmd(
@@ -1860,6 +1970,76 @@ class SGLangConfig:
                 model_loader_extra_config, separators=(",", ":")
             )
         args.pop("enable_multithread_load", None)
+
+        # === Speculative decoding (EAGLE) auto-handling ============
+        # When speculative is disabled, strip all speculative_* keys so they
+        # never appear on SGLang's command line (preserves original behaviour).
+        # When enabled, force `enable_draft_weights_cpu_backup=True`, which is
+        # required for correct cooperation with `enable_memory_saver` /
+        # offload-rollout. The internal-only flag `enable_speculative_metrics`
+        # is also stripped before forwarding to SGLang.
+        spec_algo = args.get("speculative_algorithm", None)
+        # Always strip the AReaL-internal flag — SGLang doesn't accept it.
+        args.pop("enable_speculative_metrics", None)
+        if not spec_algo:
+            for _k in (
+                "speculative_algorithm",
+                "speculative_draft_model_path",
+                "speculative_num_steps",
+                "speculative_eagle_topk",
+                "speculative_num_draft_tokens",
+                "speculative_token_map",
+                "enable_draft_weights_cpu_backup",
+            ):
+                args.pop(_k, None)
+        else:
+            # Force CPU backup for draft weights so EAGLE survives offload/wake.
+            print(
+                f"[AReaL][SGLang][EAGLE] Speculative decoding enabled: "
+                f"algo={spec_algo} num_steps={args.get('speculative_num_steps')} "
+                f"eagle_topk={args.get('speculative_eagle_topk')} "
+                f"num_draft_tokens={args.get('speculative_num_draft_tokens')} "
+                f"draft_model_path={args.get('speculative_draft_model_path')!r}"
+            )
+            # ---- BEGIN AREAL v6 EAGLE3->EAGLE auto-downgrade ----
+            # When the draft model is the *built-in* MiMoMTP head (i.e. no
+            # external draft path), the EAGLE3 verify path crashes because
+            # SGLang's MiMoMultiTokenPredictorLayer.forward unconditionally
+            # reads ``forward_batch.spec_info.hidden_states``, which only
+            # exists on ``EagleDraftInput`` (EAGLE) and NOT on
+            # ``EagleVerifyInput`` (EAGLE3).  PR#1176 (the reference
+            # implementation) only documents and tests EAGLE for built-in
+            # MTP draft -- every example config uses
+            # ``speculative_algorithm: "EAGLE"``.  We therefore auto-downgrade
+            # EAGLE3 -> EAGLE in this exact configuration to match the
+            # supported, tested code path.  External EAGLE3 draft models are
+            # left untouched.
+            _draft_path = args.get("speculative_draft_model_path")
+            if (
+                isinstance(spec_algo, str)
+                and spec_algo.upper() == "EAGLE3"
+                and not _draft_path
+            ):
+                print(
+                    "[AReaL][SGLang][EAGLE][AUTODOWNGRADE] "
+                    "speculative_algorithm='EAGLE3' is incompatible with the "
+                    "built-in MiMoMTP draft head (MiMoMultiTokenPredictorLayer."
+                    "forward reads forward_batch.spec_info.hidden_states which "
+                    "exists on EagleDraftInput but not on EagleVerifyInput). "
+                    "Auto-downgrading to 'EAGLE' to match PR#1176's documented "
+                    "configuration. Set speculative_draft_model_path=<path> to "
+                    "use a true EAGLE3 external draft model instead."
+                )
+                args["speculative_algorithm"] = "EAGLE"
+                spec_algo = "EAGLE"
+            # ---- END AREAL v6 EAGLE3->EAGLE auto-downgrade ----
+            args["enable_draft_weights_cpu_backup"] = True
+            # Drop draft_model_path if empty to fall back to in-target MTP heads.
+            if not args.get("speculative_draft_model_path"):
+                args.pop("speculative_draft_model_path", None)
+            if not args.get("speculative_token_map"):
+                args.pop("speculative_token_map", None)
+        # ===========================================================
 
         args = dict(
             # Model and tokenizer

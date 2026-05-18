@@ -46,7 +46,7 @@ from areal.infra.utils.concurrent import get_executor
 from areal.infra.utils.http import arequest_with_retry, get_default_connector
 from areal.infra.utils.launcher import wait_llm_server_addrs
 from areal.infra.utils.proc import kill_process_tree
-from areal.utils import logging, name_resolve, names
+from areal.utils import logging, name_resolve, names, stats_tracker
 from areal.utils.data import concat_padded_tensors
 from areal.utils.dynamic_import import import_from_string
 from areal.utils.network import (
@@ -820,6 +820,76 @@ class RemoteInfEngine(InferenceEngine):
             # Parse response using backend
             gen_result = self.backend.parse_generation_response(result)
             stop_reason = gen_result.stop_reason
+
+            # === EAGLE speculative-decoding acceptance metrics =================
+            # When SGLang is launched with `speculative_algorithm`, every
+            # generation chunk surfaces three counters in `meta_info`:
+            #   - spec_accept_token_num : # draft tokens actually accepted
+            #   - spec_draft_token_num  : # draft tokens proposed
+            #   - spec_verify_ct        : # verification rounds
+            # We push these into ``stats_tracker`` so they propagate through
+            # ``RemoteSGLangEngine.export_stats()`` -> trainer -> wandb /
+            # swanlab / tensorboard. The headline metric is
+            # ``rollout/eagle_accept_rate`` = accepted / drafted.
+            #
+            # v18: also emit decomposed metrics so that a stalled
+            # ``eagle_accept_rate`` curve can be diagnosed without redeploying:
+            #   * ``eagle_accept_per_verify`` -- avg accepted tokens per
+            #     verification round.  At ``num_draft_tokens=4`` the
+            #     theoretical ceiling is 4; numbers <1 mean the draft head
+            #     is essentially producing one usable token at a time.
+            #   * ``eagle_draft_quality`` = accept / (verify_ct *
+            #     num_draft_tokens_per_verify).  This normalizes against
+            #     the draft chain length so accept_rate vs accept_per_verify
+            #     can be reasoned about jointly: improvement here is the
+            #     *direct* signal that MTP fine-tuning is helping.
+            #   * ``eagle_completion_tokens`` and ``eagle_drafted_tokens``
+            #     allow downstream sanity checks that the draft head is
+            #     actually being invoked (zero values mean spec decoding
+            #     silently degraded to plain greedy).
+            spec_accept = getattr(gen_result, "spec_accept_token_num", None)
+            spec_draft = getattr(gen_result, "spec_draft_token_num", None)
+            spec_verify = getattr(gen_result, "spec_verify_ct", None)
+            spec_completion = getattr(gen_result, "completion_token_num", None)
+            if (
+                spec_accept is not None
+                and spec_draft is not None
+                and spec_draft > 0
+            ):
+                accept_rate = float(spec_accept) / float(spec_draft)
+                # Average tokens accepted per verify round (a.k.a. "accept length")
+                if spec_verify is not None and spec_verify > 0:
+                    accept_length = float(spec_accept) / float(spec_verify)
+                    # v18: accept_per_verify is identical to accept_length but
+                    # exposed under an unambiguous key for dashboards. We also
+                    # compute draft_quality = accepted / (drafted) which is the
+                    # same as accept_rate but emitted under a more searchable
+                    # name; downstream we can switch to a per-verify draft len
+                    # if SGLang exposes it.
+                    draft_quality = float(spec_accept) / float(spec_draft)
+                else:
+                    accept_length = 0.0
+                    draft_quality = 0.0
+                try:
+                    stats_tracker.scalar(
+                        eagle_accept_rate=accept_rate,
+                        eagle_accept_length=accept_length,
+                        eagle_accept_per_verify=accept_length,
+                        eagle_draft_quality=draft_quality,
+                        eagle_accept_tokens=float(spec_accept),
+                        eagle_draft_tokens=float(spec_draft),
+                        eagle_verify_ct=float(spec_verify or 0),
+                        eagle_completion_tokens=float(spec_completion or 0),
+                    )
+                except Exception as exc:  # pragma: no cover - defensive
+                    # Never block rollout on a metric emission failure.
+                    logger.debug(
+                        "[AReaL][SGLang][EAGLE] stats_tracker.scalar "
+                        "failed: %r",
+                        exc,
+                    )
+            # ===================================================================
+
 
             if (
                 req.metadata.get("return_routed_experts", False)

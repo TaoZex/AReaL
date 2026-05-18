@@ -201,6 +201,32 @@ def areal_run_scheduler_process(
             thread_label = "Decode Scheduler"
         trace_set_thread_info(thread_label, tp_rank, dp_rank)
 
+    # ---- BEGIN AREAL ----
+    # Install the MiMoMTP EAGLE3 compat patch BEFORE Scheduler() is built.
+    # SGLang's CudaGraphRunner.__init__ -- triggered transitively by
+    # Scheduler() -> TpModelWorker -> ModelRunner.initialize() ->
+    # init_device_graphs() -- calls model.set_eagle3_layers_to_capture() when
+    # spec_algorithm.is_eagle3() is True. MiMoMTP (the MTP-as-draft head
+    # class) does not implement that method upstream, which crashes the whole
+    # scheduler. The patch installs a no-op-style stub that satisfies the
+    # interface without enabling aux hidden state capture (which is
+    # meaningless for a single-block MTP draft). Idempotent + import-guarded:
+    # safe even when MTP is not in use.
+    try:
+        from areal.engine.megatron_utils.mtp import (
+            install_mimomtp_eagle3_compat_patch,
+            install_mimomtp_spec_info_compat_patch,
+        )
+
+        install_mimomtp_eagle3_compat_patch()
+        install_mimomtp_spec_info_compat_patch()
+    except Exception as _patch_exc:  # pragma: no cover - defensive
+        logger.warning(
+            "[AReaL][MTP][compat] install_mimomtp_*_compat_patch failed: %s",
+            _patch_exc,
+        )
+    # ---- END AREAL ----
+
     # Create a scheduler and run the event loop
     try:
         scheduler = Scheduler(

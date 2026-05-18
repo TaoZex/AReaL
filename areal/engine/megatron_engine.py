@@ -81,6 +81,11 @@ from areal.engine.megatron_utils.packed_context_parallel import (
 from areal.engine.megatron_utils.pipeline_parallel import (
     configure_pipeline_layer_splits,
 )
+from areal.engine.megatron_utils.mtp import (
+    all_reduce_mtp_loss,
+    compute_mtp_loss,
+    model_has_mtp,
+)
 from areal.infra.dist_rollout import DistRolloutCoordinator
 from areal.infra.platforms import current_platform
 from areal.models.mcore.hf_load import load_weights_from_hf_with_mbridge_fast
@@ -835,12 +840,41 @@ class MegatronEngine(TrainEngine):
             cp_size = mpu.get_context_parallel_world_size()
             cp_local = cp_size > 1
 
-            output = packed_context_parallel_forward(
-                model,
-                mb_input.padded_mb,
-                gather_cp_output=not cp_local,
-                is_vision_model=self.is_vision_model,
-            )
+            # === MTP (Multi-Token Prediction) online training ==================
+            # v8 design: route the MTP loss through Megatron-Core's NATIVE
+            # GPTModel._postprocess -> process_mtp_loss path. We pass `labels`
+            # (and optionally `loss_mask`) into model.forward(...) via the new
+            # `extra_model_kwargs` parameter on packed_context_parallel_forward.
+            # Megatron's process_mtp_loss internally uses MTPLossAutoScaler to
+            # inject the scaled MTP gradient into the backbone hidden_states'
+            # backward; the forward return value is unchanged.
+            #
+            # To keep AReaL's RL pipeline working (which expects logits, not a
+            # CE loss tensor) the MTPAwareForward CM also temporarily patches
+            # `inner.compute_language_model_loss` to return `logits.transpose(0,
+            # 1).contiguous()` instead of the CE loss. This means the upstream
+            # `_postprocess` returns logits to AReaL while still letting
+            # `process_mtp_loss` install its gradient hook.
+            #
+            # In inference (forward_only=True) the CM mirrors the v7
+            # `disable_inner_mtp_path` semantics: nulls inner.mtp /
+            # mtp_process / config.mtp_num_layers for the duration of the
+            # forward call so model() does not crash on missing labels.
+            #
+            # The CM is a no-op when the model has no MTP block.
+            from areal.engine.megatron_utils.mtp import MTPAwareForward
+
+            with MTPAwareForward(
+                model, mb_input.padded_mb, forward_only=forward_only
+            ) as _mtp_cm:
+                output = packed_context_parallel_forward(
+                    model,
+                    mb_input.padded_mb,
+                    gather_cp_output=not cp_local,
+                    is_vision_model=self.is_vision_model,
+                    extra_model_kwargs=_mtp_cm.extra_model_kwargs,
+                )
+            # ====================================================================
 
             # Release tree attention metadata after forward pass
             for key in tree_attn_keys:
@@ -850,7 +884,60 @@ class MegatronEngine(TrainEngine):
                 loss = process_output_fn(output_, input_)
                 if loss is None:
                     loss = torch.tensor(1.0, device=output_.device)
-                return loss, {}
+
+                # === MTP loss logging (gradient-free, optional) =============
+                # The MTP gradient has already been injected by Megatron's
+                # MTPLossAutoScaler inside model.forward() above; we do NOT
+                # add anything to `loss` here. We only OPTIONALLY surface the
+                # raw per-layer MTP loss value via MTPLossLoggingHelper for
+                # WandB tracking, then clear the tracker so it doesn't double-
+                # count across micro-batches.
+                stats: dict = {}
+                mtp_enabled_for_logging = bool(
+                    getattr(self.mcore_config, "enable_mtp_training", False)
+                    and not forward_only
+                    and getattr(
+                        self.mcore_config, "enable_mtp_loss_logging", True
+                    )
+                    and mpu.is_pipeline_last_stage(
+                        ignore_virtual=False,
+                        vp_stage=getattr(model, "vp_stage", 0),
+                    )
+                )
+                if mtp_enabled_for_logging:
+                    try:
+                        from megatron.core.transformer.multi_token_prediction import (
+                            MTPLossLoggingHelper,
+                        )
+
+                        tracker = MTPLossLoggingHelper.tracker
+                        if "values" in tracker:
+                            values = tracker["values"].detach().clone()
+                            try:
+                                MTPLossLoggingHelper.reduce_loss_in_tracker()
+                                values = tracker["values"].detach().clone()
+                            except Exception:
+                                pass
+                            mean_v = float(values.mean().item())
+                            stats["mtp_loss"] = mean_v
+                            scaling = float(
+                                getattr(
+                                    self.mcore_config,
+                                    "mtp_loss_scaling_factor",
+                                    0.2,
+                                )
+                            )
+                            stats["mtp_loss_scaled"] = mean_v * scaling
+                            try:
+                                MTPLossLoggingHelper.clean_loss_in_tracker()
+                            except Exception:
+                                pass
+                    except Exception as _e:
+                        # Logging is best-effort: never break training.
+                        pass
+                # ===========================================================
+
+                return loss, stats
 
             model_vp_stage = getattr(model, "vp_stage", 0)
             if mpu.is_pipeline_last_stage(
@@ -1110,14 +1197,23 @@ class MegatronEngine(TrainEngine):
 
         self.is_offload = False
 
-    def clear_batches(self, shard_ids: list[str]) -> None:
+    def clear_batches(self, shard_ids: list[str] | None = None) -> None:
         """Drain this worker's client-side RTensor fetch buffer.
 
         Called via RPC by ``TrainController.clear_batches`` at step end so
         cross-node consumer DP heads release cached tensors. See #1209.
-        Upstream ``TrainController.clear_batches`` guards against empty
-        input, so ``shard_ids`` is always a non-empty ``list[str]``.
+
+        ``shard_ids`` defaults to ``None`` because the upstream RPC fan-out
+        (``TrainController._call_workers``) replicates positional args only
+        to DP-head workers when ``rpc_meta={"broadcast": False}`` — non-DP
+        head workers in TP/PP setups receive an empty arg list and would
+        otherwise hit a "missing 1 required positional argument" error.
+        Treat ``None`` / empty as a no-op so non-DP-head invocations are
+        safely idempotent (their local ``_fetch_buffer`` is empty anyway,
+        as shards are only localized on DP heads).
         """
+        if not shard_ids:
+            return
         from areal.infra.rpc.rtensor import clear_fetch_buffer
 
         clear_fetch_buffer(shard_ids)
@@ -1907,6 +2003,22 @@ class MegatronEngine(TrainEngine):
                 )
             self.bridge.load_hf_weights(self.model, hf_path=path)
         else:
+            # MTP compat: monkey-patch MimoBridge so newer Megatron-Core MTP
+            # submodule names (``mtp_model_layer.*``) are accepted. No-op if
+            # mbridge isn't installed or the model isn't MiMo. Borrowed from
+            # https://github.com/areal-project/AReaL/pull/1176.
+            try:
+                from areal.engine.megatron_utils.mtp import (
+                    install_mbridge_mtp_compat_patch,
+                )
+                install_mbridge_mtp_compat_patch()
+            except Exception as e:  # pragma: no cover - best-effort
+                self.logger.warning(
+                    "[AReaL][MTP][compat] install_mbridge_mtp_compat_patch "
+                    "failed: %s — proceeding without patch (HF load may "
+                    "raise NotImplementedError on MiMo MTP weights).",
+                    e,
+                )
             load_weights_from_hf_with_mbridge_fast(
                 bridge=self.bridge,
                 models=self.model,

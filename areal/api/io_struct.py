@@ -317,6 +317,13 @@ class HttpGenerationResult:
     output_logprobs: list[float]
     stop_reason: str
     routed_experts: np.ndarray | None = None
+    # === EAGLE speculative-decoding acceptance metrics (optional) ===========
+    # Populated only when SGLang is launched with `speculative_algorithm` set.
+    # Values are extracted directly from the SGLang `meta_info` block.
+    spec_accept_token_num: int | None = None
+    spec_draft_token_num: int | None = None
+    spec_verify_ct: int | None = None
+    completion_token_num: int | None = None
 
 
 @dataclass

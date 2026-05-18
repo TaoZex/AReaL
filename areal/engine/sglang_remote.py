@@ -119,11 +119,32 @@ class SGLangBackend:
         output_tokens = [x[1] for x in meta_info["output_token_logprobs"]]
         output_logprobs = [x[0] for x in meta_info["output_token_logprobs"]]
 
+        # === EAGLE speculative-decoding acceptance metrics ====================
+        # SGLang surfaces the per-request acceptance counters in `meta_info`
+        # whenever speculative decoding is active. We forward them through
+        # HttpGenerationResult so the rollout coordinator can aggregate
+        # batch-level accept_rate / accept_length statistics.
+        spec_accept_token_num = meta_info.get("spec_accept_token_num")
+        spec_draft_token_num = meta_info.get("spec_draft_token_num")
+        spec_verify_ct = meta_info.get("spec_verify_ct")
+        completion_token_num = meta_info.get("completion_tokens")
+        # NOTE: Per-request EAGLE counters are aggregated by the rollout
+        # coordinator into batch-level eagle_accept_rate / eagle_accept_length
+        # stats — see the v18 step-level summary in
+        # ``RLTrainer._log_speculative_decoding_step_stats``. We deliberately
+        # do NOT print per-request lines here (would emit ~1700 lines/step at
+        # train_batch_size=160 and drown actionable signals).
+        # =====================================================================
+
         return HttpGenerationResult(
             output_tokens=output_tokens,
             output_logprobs=output_logprobs,
             stop_reason=stop_reason,
             routed_experts=routed_experts,
+            spec_accept_token_num=spec_accept_token_num,
+            spec_draft_token_num=spec_draft_token_num,
+            spec_verify_ct=spec_verify_ct,
+            completion_token_num=completion_token_num,
         )
 
     def build_disk_weight_update_requests(

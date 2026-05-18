@@ -30,6 +30,86 @@ def _accepts_hf_config(fn) -> bool:
     return "hf_config" in inspect.signature(fn).parameters
 
 
+# ===========================================================================
+# MTP (Multi-Token Prediction) parameter name conversion
+# ---------------------------------------------------------------------------
+# MTP layers in Megatron live at `module.module.mtp.layers.{i}.*` and need to
+# be re-mapped to a flat HuggingFace namespace that SGLang's EAGLE draft model
+# loader recognizes. For DeepSeek-V3 / GLM4-MoE-style MTP heads, the MTP layer
+# index `i` maps to HF `model.layers.{num_layers + i}.*`, with a few special
+# leaves (`eh_proj`, `enorm`, `hnorm`, `final_layernorm`).
+# All other parameters within MTP's internal `transformer_layer` are forwarded
+# through the base decoder converter by rewriting the name.
+# ===========================================================================
+_MTP_LAYER_RE = re.compile(r"module\.module\.mtp\.layers\.(\d+)\.(.+)")
+
+
+def _maybe_convert_mtp_to_hf(
+    name: str,
+    param,
+    base_num_layers: int,
+    base_decoder_converter,
+    tf_config: TransformerConfig,
+):
+    """Try to map a Megatron MTP parameter name to its HuggingFace counterpart.
+
+    Returns ``None`` if ``name`` is not an MTP parameter, otherwise a list of
+    ``(hf_name, tensor)`` tuples. The base decoder converter is invoked
+    recursively for the MTP-internal transformer layer, so that all attention /
+    MLP / expert remapping logic is reused.
+
+    Logging is intentionally verbose: every MTP parameter remap goes through
+    here, which makes regression hunting easy.
+    """
+    match = _MTP_LAYER_RE.match(name)
+    if match is None:
+        return None
+    layer_idx, rest = match.groups()
+    layer_idx = int(layer_idx)
+    hf_layer_idx = base_num_layers + layer_idx
+
+    if rest == "eh_proj.weight":
+        print(
+            f"[AReaL][MTP][convert_to_hf] MTP layer {layer_idx} -> HF "
+            f"model.layers.{hf_layer_idx}.eh_proj.weight"
+        )
+        return [(f"model.layers.{hf_layer_idx}.eh_proj.weight", param)]
+    if rest == "enorm.weight":
+        return [(f"model.layers.{hf_layer_idx}.enorm.weight", param)]
+    if rest == "hnorm.weight":
+        return [(f"model.layers.{hf_layer_idx}.hnorm.weight", param)]
+    if rest == "final_layernorm.weight":
+        # SGLang's EAGLE/MTP loader expects `shared_head.norm` for the
+        # DeepSeek-V3 / GLM-4-MoE MTP head layout.
+        return [
+            (f"model.layers.{hf_layer_idx}.shared_head.norm.weight", param),
+        ]
+
+    # Forward inner transformer_layer / mtp_model_layer parameters through the
+    # base decoder converter by rewriting the name to
+    # ``module.module.decoder.layers.{hf_idx}.*``.
+    #
+    # v16: mcore 0.17.0 renamed ``transformer_layer`` -> ``mtp_model_layer`` on
+    # ``MultiTokenPredictionLayer`` (see core_v0.17.0
+    # ``multi_token_prediction.py`` lines 818/834/960/969). Accept both
+    # prefixes so this helper works across mcore versions; slime's
+    # ``_weight_name_mapping_mcore_to_hf`` strips either prefix the same way.
+    if rest.startswith("transformer_layer."):
+        inner_rest = rest[len("transformer_layer.") :]
+    elif rest.startswith("mtp_model_layer."):
+        inner_rest = rest[len("mtp_model_layer.") :]
+    else:
+        inner_rest = rest
+    rewritten_name = (
+        f"module.module.decoder.layers.{hf_layer_idx}.{inner_rest}"
+    )
+    print(
+        f"[AReaL][MTP][convert_to_hf] MTP layer {layer_idx} inner param "
+        f"{rest!r} -> proxied via decoder converter as {rewritten_name!r}"
+    )
+    return base_decoder_converter(tf_config, rewritten_name, param)
+
+
 def _all_gather_and_concat(
     tensor: torch.Tensor,
     tp_size: int,
@@ -223,6 +303,18 @@ def convert_qwen3moe_to_hf(
         return [("lm_head.weight", param)]
     if name == "module.module.decoder.final_layernorm.weight":
         return [("model.norm.weight", param)]
+
+    # ---- MTP support (slime-style mapping) -------------------------------
+    mtp_converted = _maybe_convert_mtp_to_hf(
+        name=name,
+        param=param,
+        base_num_layers=tf_config.num_layers,
+        base_decoder_converter=convert_qwen3moe_to_hf,
+        tf_config=tf_config,
+    )
+    if mtp_converted is not None:
+        return mtp_converted
+    # ----------------------------------------------------------------------
 
     try:
         head_dim = (
@@ -810,6 +902,18 @@ def convert_qwen2_to_hf(
     if name == "module.module.decoder.final_layernorm.weight":
         return [("model.norm.weight", param)]
 
+    # ---- MTP support (slime-style mapping) -------------------------------
+    mtp_converted = _maybe_convert_mtp_to_hf(
+        name=name,
+        param=param,
+        base_num_layers=tf_config.num_layers,
+        base_decoder_converter=convert_qwen2_to_hf,
+        tf_config=tf_config,
+    )
+    if mtp_converted is not None:
+        return mtp_converted
+    # ----------------------------------------------------------------------
+
     try:
         head_dim = (
             tf_config.kv_channels
@@ -899,6 +1003,21 @@ def convert_deepseekv3_to_hf(
         return [("lm_head.weight", param)]
     if name == "module.module.decoder.final_layernorm.weight":
         return [("model.norm.weight", param)]
+
+    # ---- MTP support (slime-style mapping) -------------------------------
+    # Intercept any `module.module.mtp.layers.<i>.*` parameter and emit the
+    # HF-style names that SGLang's EAGLE draft loader expects. The recursion
+    # uses `convert_deepseekv3_to_hf` itself for the inner transformer layer.
+    mtp_converted = _maybe_convert_mtp_to_hf(
+        name=name,
+        param=param,
+        base_num_layers=tf_config.num_layers,
+        base_decoder_converter=convert_deepseekv3_to_hf,
+        tf_config=tf_config,
+    )
+    if mtp_converted is not None:
+        return mtp_converted
+    # ----------------------------------------------------------------------
 
     try:
         head_dim = (
@@ -1237,6 +1356,134 @@ def convert_bailingmoe_to_hf(
     raise ValueError(f"Unknown parameter name: {name}")
 
 
+# ===========================================================================
+# v15: MiMo (XiaomiMiMo/MiMo-7B-RL etc.) MCore -> HF converter.
+#
+# MiMo extends Qwen2 with Multi-Token Prediction (MTP) layers that have a
+# DIFFERENT HF layout than DeepSeek-V3 / SGLang-style MTP. The generic
+# ``_maybe_convert_mtp_to_hf`` above emits ``model.layers.{N+i}.<...>`` keys
+# which are correct for DSv3 but WRONG for MiMo; MiMo's HF state-dict instead
+# expects ``model.mtp_layers.{i}.{token_layernorm|hidden_layernorm|input_proj|
+# final_layernorm}.weight`` plus a COLUMN-HALF SWAP on ``eh_proj.weight``.
+#
+# Aligned with slime ``slime_plugins/mbridge/mimo.py::
+# _weight_name_mapping_mcore_to_hf`` (the same swap is applied there at
+# load-time; AReaL applies it at ship-time on the MCore -> HF path) and with
+# the public PR https://github.com/areal-project/AReaL/pull/1176 .
+# ===========================================================================
+def _convert_mimo_mtp_param(
+    tf_config: TransformerConfig,
+    name: str,
+    param: Parameter | Tensor | FP8BlockwiseTensorHelper,
+):
+    """Convert a single MiMo MTP layer parameter from Megatron to HF format.
+
+    MiMo MTP HF layout:
+        mcore ``mtp.layers.{i}.enorm.weight``
+            -> ``model.mtp_layers.{i}.token_layernorm.weight``
+        mcore ``mtp.layers.{i}.hnorm.weight``
+            -> ``model.mtp_layers.{i}.hidden_layernorm.weight``
+        mcore ``mtp.layers.{i}.eh_proj.weight``
+            -> ``model.mtp_layers.{i}.input_proj.weight`` (column-half swap)
+        mcore ``mtp.layers.{i}.final_layernorm.weight``
+            -> ``model.mtp_layers.{i}.final_layernorm.weight``
+        mcore ``mtp.layers.{i}.transformer_layer.<...>``
+            -> delegated to ``convert_qwen2_to_hf`` via a proxy decoder name,
+               then ``model.layers.{i}`` is rewritten to ``model.mtp_layers.{i}``.
+
+    Handles both naming patterns produced by different megatron-core versions:
+        * ``module.module.mtp.layers.{idx}.<...>``           (mcore native)
+        * ``module.module.decoder.mtp_layers.{idx}.<...>``   (alt layout)
+    """
+    mtp_pattern1 = r"module\.module\.mtp\.layers\.(\d+)\.(.+)"
+    mtp_pattern2 = r"module\.module\.decoder\.mtp_layers\.(\d+)\.(.+)"
+    match = re.match(mtp_pattern1, name)
+    if match is None:
+        match = re.match(mtp_pattern2, name)
+    if match is None:
+        raise ValueError(f"Invalid MiMo MTP parameter name: {name}")
+
+    layer_idx, component = match.groups()
+
+    direct_mappings = {
+        "enorm.weight": (
+            f"model.mtp_layers.{layer_idx}.token_layernorm.weight"
+        ),
+        "hnorm.weight": (
+            f"model.mtp_layers.{layer_idx}.hidden_layernorm.weight"
+        ),
+        "eh_proj.weight": (
+            f"model.mtp_layers.{layer_idx}.input_proj.weight"
+        ),
+        "final_layernorm.weight": (
+            f"model.mtp_layers.{layer_idx}.final_layernorm.weight"
+        ),
+    }
+
+    # MiMo-specific: swap column halves for eh_proj weight.
+    # MCore stores ``eh_proj`` as ``[embed_half | hidden_half]`` (concat order
+    # determined by MCore's MTP fusion); HF MiMo's ``input_proj`` expects
+    # ``[hidden_half | embed_half]``. Slime applies the inverse swap at load
+    # time in ``_weight_name_mapping_mcore_to_hf``; here we apply it on the
+    # ship path so the wire bytes match HF's expectation.
+    if component == "eh_proj.weight":
+        first_half, second_half = param.chunk(2, dim=1)
+        param = torch.cat([second_half, first_half], dim=1)
+
+    if component in direct_mappings:
+        return [(direct_mappings[component], param)]
+
+    # transformer_layer.* / mtp_model_layer.* — delegate to convert_qwen2_to_hf
+    # via proxy name, then rewrite ``model.layers.{i}`` -> ``model.mtp_layers.{i}``.
+    #
+    # v16: megatron-core 0.17.0 renamed the MTP inner transformer attribute
+    # from ``transformer_layer`` to ``mtp_model_layer`` (see
+    # ``megatron/core/transformer/multi_token_prediction.py`` lines 818, 834,
+    # 960, 969 in core_v0.17.0). Earlier AReaL versions and slime were both
+    # written against the older ``transformer_layer`` name. Mcore's own
+    # checkpoint-loader remap (multi_token_prediction.py:1191) handles the
+    # legacy direction at load time, but the *parameter iterator* used on the
+    # ship path yields the live attribute name, so we must accept both.
+    # This keeps the converter compatible with mcore <0.17 (transformer_layer)
+    # AND mcore 0.17+ (mtp_model_layer), matching the slime behaviour where
+    # ``_weight_name_mapping_mcore_to_hf`` strips either prefix.
+    _INNER_PREFIXES = ("transformer_layer.", "mtp_model_layer.")
+    for _prefix in _INNER_PREFIXES:
+        if component.startswith(_prefix):
+            transformer_component = component[len(_prefix):]
+            proxy_name = (
+                f"module.module.decoder.layers.{layer_idx}.{transformer_component}"
+            )
+            results = convert_qwen2_to_hf(tf_config, proxy_name, param)
+            converted_results = []
+            for hf_name, hf_param in results:
+                hf_name = hf_name.replace(
+                    f"model.layers.{layer_idx}",
+                    f"model.mtp_layers.{layer_idx}",
+                )
+                converted_results.append((hf_name, hf_param))
+            return converted_results
+
+    raise ValueError(f"Unknown MiMo MTP component: {component} in {name}")
+
+
+def convert_mimo_to_hf(
+    tf_config: TransformerConfig,
+    name: str,
+    param: Parameter | Tensor | FP8BlockwiseTensorHelper,
+):
+    """Convert MiMo model parameters from Megatron to HuggingFace format.
+
+    MiMo is Qwen2 + MTP. Non-MTP parameters are delegated unchanged to
+    ``convert_qwen2_to_hf``; MTP parameters go through
+    ``_convert_mimo_mtp_param`` which emits the MiMo-specific HF layout
+    (``model.mtp_layers.{i}.*``) with the eh_proj column-half swap.
+    """
+    if "mtp" in name:
+        return _convert_mimo_mtp_param(tf_config, name, param)
+    return convert_qwen2_to_hf(tf_config, name, param)
+
+
 # Adapted from slime
 # A registry for conversion functions is more extensible.
 # Ordering matters: ``convert_to_hf`` dispatches on the FIRST substring hit, so
@@ -1257,6 +1504,11 @@ _CONVERSION_FN_REGISTRY = {
     "bailing_moe_v2": convert_bailingmoe_to_hf,
     "bailing_moe_linear": convert_bailingmoe_to_hf,
     "bailing_hybrid": convert_bailingmoe_to_hf,
+    # v15: MiMo (Qwen2 + MTP) — must come AFTER ``qwen2``/``qwen3`` substring
+    # entries (which it does, since ``mimo`` is not a substring of any of
+    # them and substring-match dispatch in ``convert_to_hf`` is FIRST-HIT).
+    # Aligned with slime ``slime_plugins/mbridge/mimo.py``.
+    "mimo": convert_mimo_to_hf,
 }
 
 

@@ -288,6 +288,7 @@ def packed_context_parallel_forward(
     input_: dict[str, Any],
     gather_cp_output: bool = True,
     is_vision_model: bool = False,
+    extra_model_kwargs: dict[str, Any] | None = None,
 ):
     input_ids = input_["input_ids"]
     position_ids = input_.get("position_ids", None)
@@ -314,6 +315,61 @@ def packed_context_parallel_forward(
                 input_ids, cu_seqlens
             )
             input_ids = input_ids.contiguous()
+            # ===== v10 fix: align extra_model_kwargs labels / loss_mask shape =====
+            # When MTPAwareForward injects ``labels`` and ``loss_mask`` via
+            # ``extra_model_kwargs``, those tensors are still in the ORIGINAL
+            # packed form (1D ``[total_S]`` or 2D ``[1, total_S]``), but
+            # ``input_ids`` has just been re-shuffled by
+            # ``preprocess_packed_seqs_context_parallel`` (and possibly
+            # CP-split when ``cp_size > 1``).  Megatron-core's
+            # ``GPTModel._postprocess`` then forwards these tensors to
+            # ``process_mtp_loss(labels, loss_mask, ..., packed_seq_params)``
+            # which assumes their shape matches ``input_ids`` and the
+            # ``packed_seq_params`` we just produced.  If we leave the
+            # original shape, ``process_mtp_loss`` crashes (or silently
+            # consumes mismatched indices under CP).
+            #
+            # This mirrors slime's contract under THUDM Megatron: slime's
+            # ``batch["tokens"]`` (which it routes both as ``input_ids`` and
+            # as ``mtp_kwargs.mtp_labels``) is already in the post-packed /
+            # post-CP-split form when handed to ``model(...)``.  AReaL's
+            # data-loading path produces tensors in the PRE-reshape form
+            # and relies on ``packed_context_parallel_forward`` to do the
+            # reshape internally, so we must extend the same reshape to the
+            # caller-supplied ``labels`` / ``loss_mask``.
+            #
+            # Detection rule: only reshape tensors whose flattened length
+            # matches the original ``cu_seqlens[-1]`` (i.e. the pre-reshape
+            # total packed length).  This protects against caller passing
+            # already-reshaped tensors.
+            if extra_model_kwargs:
+                _orig_total_len = (
+                    int(cu_seqlens[-1].item())
+                    if cu_seqlens.numel() > 0
+                    else 0
+                )
+                _reshape_keys = ("labels", "loss_mask")
+                _reshaped: dict[str, Any] = {}
+                for _k in _reshape_keys:
+                    _v = extra_model_kwargs.get(_k, None)
+                    if _v is None or not isinstance(_v, torch.Tensor):
+                        continue
+                    _flat_len = _v.numel()
+                    if _flat_len != _orig_total_len:
+                        # Already reshaped (e.g. caller pre-reshaped) or
+                        # shape we don't understand -- leave as-is.
+                        continue
+                    _v_1d = _v.reshape(-1).contiguous()
+                    _v_reshaped, _ = preprocess_packed_seqs_context_parallel(
+                        _v_1d, cu_seqlens
+                    )
+                    _reshaped[_k] = _v_reshaped.contiguous()
+                if _reshaped:
+                    # Build a new dict so we don't mutate caller state.
+                    extra_model_kwargs = {
+                        **extra_model_kwargs,
+                        **_reshaped,
+                    }
         else:
             # VLM models expect batch-form [B, S] input_ids for mRoPE position
             # computation and vision token embedding replacement. Reconstruct
@@ -360,6 +416,16 @@ def packed_context_parallel_forward(
             if key in input_:
                 vlm_kwargs[key] = input_[key]
 
+    # Caller-supplied extra kwargs (e.g., labels / loss_mask injected by
+    # MTPAwareForward to route MTP loss through Megatron's
+    # GPTModel._postprocess->process_mtp_loss path). These take precedence over
+    # any same-named entries in vlm_kwargs.
+    merged_extra_kwargs: dict[str, Any] = {}
+    if extra_model_kwargs:
+        for k, v in extra_model_kwargs.items():
+            if v is not None:
+                merged_extra_kwargs[k] = v
+
     try:
         output = model(
             input_ids=input_ids,
@@ -367,11 +433,14 @@ def packed_context_parallel_forward(
             position_ids=position_ids,
             packed_seq_params=packed_seq_params,
             **vlm_kwargs,
+            **merged_extra_kwargs,
         )
     except Exception as e:
         raise RuntimeError(
-            f"Error occurred in packed context parallel forward pass on model {model} "
-            f"with input_ids shape {input_ids.shape} and packed_seq_params {packed_seq_params}."
+            f"Error occurred in packed context parallel forward pass on model "
+            f"{type(model).__name__} with input_ids shape {tuple(input_ids.shape)} "
+            f"and packed_seq_params {packed_seq_params}. "
+            f"merged_extra_kwargs.keys={list(merged_extra_kwargs.keys())}"
         ) from e
 
     model_vp_stage = getattr(model, "vp_stage", None)
