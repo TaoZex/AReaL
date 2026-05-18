@@ -70,10 +70,17 @@ $\nabla_\theta J_{GRPO}( \theta) + \beta \cdot \nabla_\theta
 J_{RKL}(\theta)$.
 
 - Implementation Detail: In the joint loss case (`rl_loss_weight` > 0), the RKL is
-  treated as a direct penalty. Minimizing the term `logprobs - teacher_logp` is
-  mathematically equivalent to minimizing the Reverse KL objective
-  $D_{KL}(\pi_\theta \parallel \pi_T)$ when sampling from the student distribution
-  $\pi_\theta$. In the code, this is implemented as:
+  treated as a direct penalty. We use Schulman's k3 unbiased RKL estimator
+  `exp(teacher_logp - logprobs) - (teacher_logp - logprobs) - 1` instead of the
+  naive k1 form `logprobs - teacher_logp`. The reason: `teacher_logp` is
+  `.detach()`-ed in the implementation, so the gradient of the k1 term with
+  respect to θ collapses to `grad(logprobs)` and becomes independent of the
+  teacher's value — i.e. a uniform negative-entropy regulariser rather than a
+  distillation signal. The k3 estimator is non-negative, has the same
+  expectation as the true KL, and its gradient
+  `(1 - exp(teacher_logp - logprobs)) * grad(logprobs)` explicitly depends on
+  `teacher_logp`, restoring genuine teacher-driven alignment. In the code, this
+  is implemented as:
   `loss = rl_loss_weight * loss + distill_loss_weight * rkl_penalty`
 
 ## Running the example

@@ -144,6 +144,11 @@ class PPOTrainer:
         self._should_offload_teacher = (
             config.teacher is not None and config.teacher.offload
         )
+        self._should_offload_teachers = (
+            getattr(config, "teachers", None) is not None
+            and len(config.teachers) > 0
+            and any(t.offload for t in config.teachers.values())
+        )
 
         # Validate config before proceeding with weight initialization
         self._validate_cfg()
@@ -186,6 +191,31 @@ class PPOTrainer:
                 config.teacher.backend, name="teacher"
             )
             self.teacher = self._create_train_engine(config.teacher, teacher_alloc)
+
+        # ------------------------------------------------------------
+        # Multi-teacher On-Policy Distillation (MoPD).
+        # ------------------------------------------------------------
+        self.teachers: dict[str, Any] | None = None
+        if getattr(config, "teachers", None) is not None and len(config.teachers) > 0:
+            from areal.trainer.ppo.mopd_utils import is_mopd_enabled
+
+            assert is_mopd_enabled(config), (
+                "[MoPD] PPOConfig.teachers is set but is_mopd_enabled returned False. "
+                "This indicates an internal inconsistency."
+            )
+            self.teachers = {}
+            for t_name, t_cfg in config.teachers.items():
+                t_alloc = ModelAllocation.from_str(
+                    t_cfg.backend, name=f"teacher_{t_name}"
+                )
+                logger.info(
+                    "[MoPD] Creating teacher engine name=%r key=%r backend=%s path=%s",
+                    t_name,
+                    getattr(t_cfg, "key", None),
+                    t_cfg.backend,
+                    t_cfg.path,
+                )
+                self.teachers[t_name] = self._create_train_engine(t_cfg, t_alloc)
 
         steps_per_epoch: int | None = None
         self.train_dataloader: StatefulDataLoader | _EmptyDataLoader
@@ -283,6 +313,13 @@ class PPOTrainer:
 
         if self.teacher is not None:
             self.teacher.initialize(**engine_init_kwargs, role="teacher")
+
+        # MoPD: initialize every teacher engine.
+        if self.teachers is not None:
+            for t_name, t_engine in self.teachers.items():
+                role = f"teacher_{t_name}"
+                logger.info("[MoPD] Initializing teacher engine role=%s", role)
+                t_engine.initialize(**engine_init_kwargs, role=role)
 
         # Save initial LoRA weights if enabled (for inference server pre-loading)
         initial_lora_path = self._save_initial_lora_weights()
@@ -497,6 +534,16 @@ class PPOTrainer:
             self._offload_model(self.critic, role="critic")
         if self._should_offload_teacher:
             self._offload_model(self.teacher, role="teacher")
+        if self.teachers is not None:
+            for t_name, t_engine in self.teachers.items():
+                t_cfg = self.config.teachers[t_name]
+                if t_cfg.offload:
+                    logger.info(
+                        "[MoPD] Initial offload of teacher name=%r role=teacher_%s",
+                        t_name,
+                        t_name,
+                    )
+                    self._offload_model(t_engine, role=f"teacher_{t_name}")
         if self._should_offload_actor:
             self._offload_model(self.actor, role="actor")
 
@@ -627,6 +674,102 @@ class PPOTrainer:
                 if self._should_offload_teacher:
                     self._offload_model(self.teacher, role="teacher")
 
+            # ----------------------------------------------------------
+            # Multi-teacher On-Policy Distillation (MoPD): route each
+            # trajectory to its configured teacher via ``config.teacher_key``,
+            # run per-teacher ``compute_logp``, and scatter the results back.
+            # ----------------------------------------------------------
+            if self.teachers is not None:
+                from areal.trainer.ppo.mopd_utils import (
+                    group_trajectories_by_teacher,
+                    merge_per_teacher_logps,
+                    reorder_logps_to_batch,
+                )
+
+                teacher_key = getattr(
+                    self.config, "teacher_key", "data_source"
+                )
+                logger.info(
+                    "[MoPD] Begin multi-teacher logp computation: "
+                    "num_teachers=%d batch_size=%d teacher_key=%r",
+                    len(self.teachers),
+                    len(rollout_batch),
+                    teacher_key,
+                )
+                groups = group_trajectories_by_teacher(
+                    rollout_batch=list(rollout_batch),
+                    teachers_cfg=self.config.teachers,
+                    teacher_key=teacher_key,
+                )
+                per_teacher_results: list[list[Any]] = []
+                with (
+                    stats_tracker.record_timing("teachers_logp"),
+                    perf_tracer.trace_scope(
+                        "train.teachers_logp",
+                        category=Category.COMPUTE,
+                        args={"global_step": global_step},
+                    ),
+                ):
+                    for t_name, t_engine in self.teachers.items():
+                        t_cfg = self.config.teachers[t_name]
+                        idxs = groups[t_name]
+                        if not idxs:
+                            logger.info(
+                                "[MoPD] teacher=%r has 0 routed samples "
+                                "this step; skipping forward.",
+                                t_name,
+                            )
+                            per_teacher_results.append(
+                                [None] * len(rollout_batch)
+                            )
+                            continue
+                        if t_cfg.offload:
+                            self._onload_model(
+                                t_engine, role=f"teacher_{t_name}"
+                            )
+                        sub_batch = [rollout_batch[i] for i in idxs]
+                        logger.info(
+                            "[MoPD] teacher=%r computing logp on %d routed samples",
+                            t_name,
+                            len(sub_batch),
+                        )
+                        sub_logps = t_engine.compute_logp(sub_batch)
+                        per_teacher_results.append(
+                            reorder_logps_to_batch(
+                                rollout_batch_size=len(rollout_batch),
+                                indices=idxs,
+                                logps=sub_logps,
+                            )
+                        )
+                        t_engine.get_device_stats().log(
+                            f"teacher_{t_name} logp"
+                        )
+                        if t_cfg.offload:
+                            self._offload_model(
+                                t_engine, role=f"teacher_{t_name}"
+                            )
+                merged = merge_per_teacher_logps(
+                    per_teacher_results=per_teacher_results,
+                    rollout_batch_size=len(rollout_batch),
+                )
+                from areal.trainer.ppo.mopd_utils import compute_owning_teachers
+
+                teacher_names_ordered = list(self.teachers.keys())
+                mopd_owning_per_slot: list[str] = compute_owning_teachers(
+                    per_teacher_results=per_teacher_results,
+                    teacher_names_ordered=teacher_names_ordered,
+                    rollout_batch_size=len(rollout_batch),
+                )
+                for slot, traj in enumerate(rollout_batch):
+                    traj["teacher_logp"] = merged[slot]
+                logger.info(
+                    "[MoPD] Finished multi-teacher logp computation; all "
+                    "%d trajectories carry teacher_logp.",
+                    len(rollout_batch),
+                )
+            else:
+                mopd_owning_per_slot = []
+
             if self._should_offload_actor:
                 self._onload_model(self.actor, role="actor")
             if config.actor.should_compute_prox_logp():
@@ -671,8 +814,86 @@ class PPOTrainer:
                     args={"global_step": global_step},
                 ),
             ):
-                self.actor.ppo_update(adv_batch)
-                self.actor.step_lr_scheduler()
+                if self.teachers is not None and mopd_owning_per_slot:
+                    # MoPD ppo_update: per-traj scalars (rl_loss_weight,
+                    # distill_loss_weight) cannot be safely stamped on a
+                    # heterogeneous mini-batch because
+                    # ``concat_padded_tensors`` collapses non-tensor
+                    # non-list values to traj[0]'s value
+                    # (areal/utils/data.py:286-296). Two cases:
+                    #   1. Uniform weights -> stamp once on the full batch
+                    #      and call ``ppo_update`` once.
+                    #   2. Divergent weights -> bucket by owning teacher
+                    #      and run ``ppo_update`` per bucket.
+                    from areal.trainer.ppo.mopd_utils import (
+                        bucketize_indices_by_owner,
+                        teachers_share_uniform_weights,
+                    )
+
+                    assert len(adv_batch) == len(mopd_owning_per_slot), (
+                        f"[MoPD] adv_batch len {len(adv_batch)} != "
+                        f"owning len {len(mopd_owning_per_slot)}; "
+                        "compute_advantages must preserve trajectory order."
+                    )
+
+                    if teachers_share_uniform_weights(self.config.teachers):
+                        first_cfg = next(iter(self.config.teachers.values()))
+                        rl_w = float(first_cfg.rl_loss_weight)
+                        dl_w = float(first_cfg.distill_loss_weight)
+                        for traj in adv_batch:
+                            traj["rl_loss_weight"] = rl_w
+                            traj["distill_loss_weight"] = dl_w
+                        try:
+                            logger.info(
+                                "[MoPD] uniform-weight single ppo_update "
+                                "size=%d rl_loss_weight=%s "
+                                "distill_loss_weight=%s num_teachers=%d",
+                                len(adv_batch),
+                                rl_w,
+                                dl_w,
+                                len(self.config.teachers),
+                            )
+                            self.actor.ppo_update(adv_batch)
+                        finally:
+                            for traj in adv_batch:
+                                traj.pop("rl_loss_weight", None)
+                                traj.pop("distill_loss_weight", None)
+                    else:
+                        logger.warning(
+                            "[MoPD] teachers carry divergent "
+                            "rl_loss_weight/distill_loss_weight; falling "
+                            "back to per-bucket ppo_update."
+                        )
+                        buckets = bucketize_indices_by_owner(mopd_owning_per_slot)
+                        for owner, idxs in buckets.items():
+                            if not idxs:
+                                continue
+                            t_cfg = self.config.teachers[owner]
+                            rl_w = float(t_cfg.rl_loss_weight)
+                            dl_w = float(t_cfg.distill_loss_weight)
+                            bucket = [adv_batch[i] for i in idxs]
+                            for traj in bucket:
+                                traj["rl_loss_weight"] = rl_w
+                                traj["distill_loss_weight"] = dl_w
+                            try:
+                                logger.info(
+                                    "[MoPD] ppo_update bucket teacher=%r "
+                                    "size=%d rl_loss_weight=%s "
+                                    "distill_loss_weight=%s",
+                                    owner,
+                                    len(bucket),
+                                    rl_w,
+                                    dl_w,
+                                )
+                                self.actor.ppo_update(bucket)
+                            finally:
+                                for traj in bucket:
+                                    traj.pop("rl_loss_weight", None)
+                                    traj.pop("distill_loss_weight", None)
+                    self.actor.step_lr_scheduler()
+                else:
+                    self.actor.ppo_update(adv_batch)
+                    self.actor.step_lr_scheduler()
                 self.actor.get_device_stats().log("ppo update")
 
             if (
@@ -1191,6 +1412,7 @@ class PPOTrainer:
                 self._should_offload_critic,
                 self._should_offload_ref,
                 self._should_offload_teacher,
+                self._should_offload_teachers,
             )
         )
 

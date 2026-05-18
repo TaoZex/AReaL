@@ -65,18 +65,16 @@ class PPOActor:
 
         self.m2_threshold = config.m2_threshold
 
-        # Log critical GSPO/GRPO configuration for reproducibility
         self._log_configuration()
 
     def _log_configuration(self):
-        """Log PPO configuration including how proximal policy is computed."""
+        """Log PPO configuration."""
         config = self.config
 
         logger.info("=" * 70)
         logger.info("PPOActor Configuration")
         logger.info("=" * 70)
 
-        # Log PPO mode and proximal policy computation
         if not config.use_decoupled_loss:
             logger.info("Mode: Standard PPO (on-policy)")
             if config.recompute_logprob:
@@ -89,7 +87,6 @@ class PPOActor:
             logger.info("Mode: Decoupled PPO (off-policy)")
             logger.info("  log_p_behave (π_behave): FROM INFERENCE (behavior policy)")
 
-            # Log proximal policy computation method
             method_descriptions = {
                 PROX_LOGP_METHOD_RECOMPUTE: "RECOMPUTED via forward pass (standard decoupled PPO)",
                 PROX_LOGP_METHOD_LOGLINEAR: "LOG-LINEAR APPROXIMATION (no forward pass)",
@@ -111,7 +108,6 @@ class PPOActor:
                     + (f", agg={rs.agg}" if rs.level == "sequence" else "")
                 )
 
-        # Log other critical config
         logger.info("=" * 70)
         logger.info("Training Parameters:")
         logger.info(
@@ -304,6 +300,7 @@ class PPOActor:
             seq_len=seqlens.float(),
         )
         stats_tracker.stat(**seq_stats, denominator="n_seqs")
+
         scalars = dict(
             mask_no_eos_with_zero=self.config.mask_no_eos_with_zero,
             eps_clip=self.config.eps_clip,
@@ -503,13 +500,129 @@ def grpo_loss_fn(
 
             rkl_stat = -1 * rkl_weighted_term
         else:
-            # KDRL: Knowledge Distillation + Reinforcement Learning (joint loss)
-            rkl_penalty_per_token = (logprobs - teacher_logp) * loss_mask
-            rkl_penalty = rkl_penalty_per_token.sum() / loss_mask.sum().clamp(min=1)
+            # KDRL: Knowledge Distillation + Reinforcement Learning (joint loss).
+            # Use the Schulman k3 unbiased reverse-KL estimator:
+            #     KL(pi || pi_T) ~= exp(teacher_logp - logprobs)
+            #                       - (teacher_logp - logprobs) - 1
+            # k3 is non-negative and its gradient
+            #     (1 - exp(teacher_logp - logprobs)) * grad(logprobs)
+            # depends on ``teacher_logp`` (unlike k1 with detached teacher).
+            log_ratio = teacher_logp - logprobs
+            # Symmetric clamp on log_ratio for numerical safety; bounds
+            # the per-token k3 penalty at exp(clip).
+            distill_log_ratio_clip = float(
+                input_data.get("distill_log_ratio_clip", 10.0)
+            )
+            if distill_log_ratio_clip > 0:
+                log_ratio_for_loss = torch.clamp(
+                    log_ratio,
+                    min=-distill_log_ratio_clip,
+                    max=distill_log_ratio_clip,
+                )
+            else:
+                log_ratio_for_loss = log_ratio
+            # Per-token catastrophic-token mask: zero out distill loss on
+            # tokens where ``|log_ratio| > distill_skip_threshold``. Default
+            # 0.0 = disabled. Recommended value: 5.0 (verl default).
+            distill_skip_threshold = float(
+                input_data.get("distill_skip_threshold", 0.0)
+            )
+            if distill_skip_threshold > 0:
+                distill_token_mask = (
+                    log_ratio.detach().abs() <= distill_skip_threshold
+                ).to(loss_mask.dtype)
+                final_distill_mask = loss_mask * distill_token_mask
+            else:
+                distill_token_mask = None
+                final_distill_mask = loss_mask
+            rkl_penalty_per_token = (
+                torch.exp(log_ratio_for_loss) - log_ratio_for_loss - 1.0
+            ) * final_distill_mask
+            rkl_penalty = (
+                rkl_penalty_per_token.sum()
+                / final_distill_mask.sum().clamp(min=1)
+            )
 
             loss = rl_loss_weight * loss + distill_loss_weight * rkl_penalty
 
             rkl_stat = rkl_penalty_per_token
+
+            # Catastrophic-token counts (per-batch summary metric).
+            try:
+                with torch.no_grad():
+                    valid_mask_for_count = (
+                        loss_mask.bool()
+                        if loss_mask.dtype != torch.bool
+                        else loss_mask
+                    )
+                    if valid_mask_for_count.any():
+                        lr_v_full = log_ratio[valid_mask_for_count].float()
+                        n_valid = int(valid_mask_for_count.sum().item())
+                        n_pos5 = int((lr_v_full > 5.0).sum().item())
+                        n_pos6 = int((lr_v_full > 6.0).sum().item())
+                        n_pos7 = int((lr_v_full > 7.0).sum().item())
+                        n_pos8 = int((lr_v_full > 8.0).sum().item())
+                        n_neg10 = int((lr_v_full < -10.0).sum().item())
+                        n_clipped = int(
+                            (lr_v_full.abs() > distill_log_ratio_clip)
+                            .sum()
+                            .item()
+                        ) if distill_log_ratio_clip > 0 else 0
+                        if distill_token_mask is not None:
+                            n_skipped = int(
+                                (
+                                    valid_mask_for_count.float()
+                                    * (1.0 - distill_token_mask.float())
+                                ).sum().item()
+                            )
+                        else:
+                            n_skipped = 0
+                        try:
+                            rl_part_abs = float(
+                                (stat["loss"] * loss_mask)
+                                .abs()
+                                .sum()
+                                .item()
+                            ) / max(int(loss_mask.sum().item()), 1)
+                        except Exception:
+                            rl_part_abs = float("nan")
+                        distill_part_abs = float(rkl_penalty.abs().item())
+                        rl_w = float(rl_loss_weight)
+                        d_w = float(distill_loss_weight)
+                        if rl_part_abs and rl_w > 0:
+                            ratio = (d_w * distill_part_abs) / (
+                                rl_w * rl_part_abs + 1e-12
+                            )
+                        else:
+                            ratio = float("nan")
+                        logger.info(
+                            "[MoPD-CLIP] log_ratio safety clip=%.1f "
+                            "skip_thr=%.1f valid_tokens=%d "
+                            "pos_gt5=%d pos_gt6=%d pos_gt7=%d pos_gt8=%d neg_lt_m10=%d "
+                            "clipped=%d skipped=%d "
+                            "lr_max=%.3f lr_min=%.3f "
+                            "rl_part_abs=%.4f distill_part_abs=%.4f "
+                            "rl_w=%.4f d_w=%.4f distill_over_rl=%.4f",
+                            distill_log_ratio_clip,
+                            distill_skip_threshold,
+                            n_valid,
+                            n_pos5,
+                            n_pos6,
+                            n_pos7,
+                            n_pos8,
+                            n_neg10,
+                            n_clipped,
+                            n_skipped,
+                            float(lr_v_full.max().item()),
+                            float(lr_v_full.min().item()),
+                            rl_part_abs,
+                            distill_part_abs,
+                            rl_w,
+                            d_w,
+                            ratio,
+                        )
+            except Exception:
+                pass
 
     # Log training statistics
     stats_tracker.denominator(
@@ -524,6 +637,21 @@ def grpo_loss_fn(
             rkl_loss=rkl_stat,
             denominator="n_valid_tokens",
         )
+        # Distillation effectiveness metrics (mirrors verl's
+        # actor/distillation/{loss,abs_loss,loss_min,loss_max} namespace).
+        with torch.no_grad():
+            valid_mask = loss_mask.bool()
+            if valid_mask.any():
+                abs_rkl_full = (rkl_stat.abs() * loss_mask).float()
+                stats_tracker.stat(
+                    distill_abs_loss=abs_rkl_full,
+                    denominator="n_valid_tokens",
+                )
+                rkl_valid = rkl_stat[valid_mask].float()
+                stats_tracker.scalar(
+                    distill_loss_min=rkl_valid.min().item(),
+                    distill_loss_max=rkl_valid.max().item(),
+                )
 
     stats_tracker.stat(
         importance_weight=stat["importance_weight"],

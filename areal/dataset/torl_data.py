@@ -73,7 +73,16 @@ def get_torl_data_rl_dataset(
     split: str,
     tokenizer,
     max_length: int | None = None,
+    data_source: str | None = None,
 ):
+    """Load ToRL as an RL dataset.
+
+    The raw parquet file already carries a ``data_source`` column per row,
+    which is the canonical routing identifier used by Multi-teacher
+    On-Policy Distillation (MoPD). When the caller supplies an explicit
+    ``data_source`` override it is applied uniformly to every row;
+    otherwise the per-row value is preserved unchanged.
+    """
     prepare_torl_data(int(os.getenv("RANK", "0")))
     # Load parquet dataset instead of json
     dataset = load_dataset("parquet", data_files=path, split="train")
@@ -82,7 +91,18 @@ def get_torl_data_rl_dataset(
         # Handle the prompt content - it might be a list of messages or a string
         answer = sample["reward_model"]["ground_truth"]
         answer = f"\\boxed{{{answer}}}"
-        return {"messages": sample["prompt"], "answer": answer}
+        # Preserve (or override) the parquet's per-row ``data_source`` so
+        # downstream MoPD routing can read sample["data_source"]. When
+        # MoPD is disabled, downstream code simply ignores the field.
+        return {
+            "messages": sample["prompt"],
+            "answer": answer,
+            "data_source": (
+                data_source
+                if data_source is not None
+                else sample.get("data_source", path)
+            ),
+        }
 
     dataset = dataset.map(process).remove_columns(["prompt", "reward_model"])
 

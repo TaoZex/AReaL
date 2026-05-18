@@ -350,6 +350,23 @@ def split_and_unpad_tensor(
                 )
                 for i, s in enumerate(splits):
                     split_result[i][key] = s
+            elif isinstance(value, list) and len(value) == total:
+                # MoPD per-trajectory routing field (``data_source``) and
+                # any other list that the upstream ``concat_padded_tensors``
+                # flat-concatenated must be sliced back into per-traj
+                # buckets — *not* deepcopied wholesale, otherwise every
+                # split inherits the *full* concatenated list (length
+                # ``total``) and a subsequent ``concat_batch`` produces a
+                # length-``n_trajs * total`` list which silently breaks
+                # any per-traj indexed consumer (e.g. the per-data_source
+                # task_reward block in actor._ppo_update). See
+                # areal/workflow/rlvr.py "store as a *single-element
+                # list*" rationale + areal/utils/data.py:286-296
+                # concat_padded_tensors list branch.
+                offset = 0
+                for i, sz in enumerate(traj_group_sizes):
+                    split_result[i][key] = list(value[offset : offset + sz])
+                    offset += sz
             else:
                 for i in range(n_trajs):
                     split_result[i][key] = copy.deepcopy(value)
@@ -736,6 +753,14 @@ def split_padded_tensor_dict_into_mb_list(
     # check tensor shape, split only 1d tensors with length "total_lens"
     to_split = {}
     not_to_split = {}
+    # Per-traj list fields that need to be split per microbatch (e.g.
+    # MoPD's ``data_source`` routing key). Detected at runtime as: any
+    # list-typed value whose length equals the global batch size ``bs``.
+    # Without this, ``not_to_split`` keeps the full ``bs``-length list on
+    # every microbatch, which means downstream consumers in
+    # ``grpo_loss_fn`` cannot map row ``j`` of the microbatch back to its
+    # routing key — or worse, would mis-align if they tried.
+    per_traj_list_fields: dict[str, list] = {}
     for key, value in data.items():
         if key in multimodal_keys:
             continue
@@ -744,6 +769,10 @@ def split_padded_tensor_dict_into_mb_list(
         ):
             # NOTE: qwen2.5-vl position_ids.numel() == bs * max_seqlen * 3
             to_split[key] = value
+        elif isinstance(value, list) and len(value) == bs:
+            # Defer per-microbatch slicing until ``forward_indices`` is
+            # known — handled in the assembly loop below.
+            per_traj_list_fields[key] = value
         else:
             not_to_split[key] = value
 
@@ -800,7 +829,21 @@ def split_padded_tensor_dict_into_mb_list(
     # organize splitted micro batches
     assert len(mbs) == len(splitted_lens), (len(mbs), len(splitted_lens))
     for i, (mb, lens) in enumerate(zip(mbs, splitted_lens)):
-        results.append({**mb, **not_to_split})
+        # Slice each per-traj list field into this microbatch's traj
+        # subset using ``group_indices[i]`` (the global traj indices that
+        # ended up in this microbatch). Without this, the entire
+        # ``bs``-length list would be propagated on every microbatch and
+        # ``grpo_loss_fn`` would not know which row index to use.
+        per_mb_lists: dict[str, list] = {}
+        for key, full_list in per_traj_list_fields.items():
+            try:
+                per_mb_lists[key] = [full_list[j] for j in group_indices[i]]
+            except Exception:
+                # Defensive: if anything goes wrong, fall back to the full
+                # list and let the downstream consumer detect the
+                # length mismatch (rather than corrupting routing).
+                per_mb_lists[key] = list(full_list)
+        results.append({**mb, **not_to_split, **per_mb_lists})
 
     return MicroBatchList(
         data=data,

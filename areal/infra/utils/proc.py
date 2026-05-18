@@ -65,13 +65,29 @@ def build_streaming_log_cmd(
     # Check if stdbuf is available (not present on macOS by default)
     _has_stdbuf = shutil.which("stdbuf") is not None
 
+    # ``stdbuf`` works by injecting ``/usr/libexec/coreutils/libstdbuf.so``
+    # into ``LD_PRELOAD`` of its child. When the child is a Python worker
+    # that *also* needs its own ``LD_PRELOAD`` (e.g. the
+    # ``torch_memory_saver_hook_mode_preload.abi3.so`` shim used by
+    # ``enable_offload=True``), ``stdbuf`` ends up appending its hook to
+    # the user-provided ``LD_PRELOAD`` with a ``:`` separator. On systems
+    # whose ``ld.so`` does not split ``LD_PRELOAD`` on ``:`` (only on
+    # whitespace), the resulting concatenated path is treated as a single
+    # filename and the dlopen of the *outer* shim then fails with
+    # ``OSError: <tms.so>:/usr/libexec/coreutils/libstdbuf.so: cannot open
+    # shared object file``. Skip ``stdbuf`` whenever the caller is already
+    # supplying ``LD_PRELOAD`` — line-buffering for downstream tools
+    # (e.g. ``python -u``) is the worker's responsibility in that case.
+    _ld_preload_in_env = bool(env_vars) and "LD_PRELOAD" in env_vars
+    _wrap_cmd_with_stdbuf = _has_stdbuf and not _ld_preload_in_env
+
     # Build prefix with env vars if provided
     prefix_parts = []
     if env_vars:
         prefix_parts.append(
             " ".join(f"{k}={shlex.quote(str(v))}" for k, v in env_vars.items())
         )
-    if _has_stdbuf:
+    if _wrap_cmd_with_stdbuf:
         prefix_parts.append(f"stdbuf -oL {cmd_str}")
     else:
         prefix_parts.append(cmd_str)
@@ -80,7 +96,10 @@ def build_streaming_log_cmd(
     # Build log prefix for merged log
     log_prefix = f"[{role}]".ljust(LOG_PREFIX_WIDTH)
 
-    # Construct tee/sed pipeline
+    # Construct tee/sed pipeline. The downstream ``sed`` does not inherit
+    # the worker's ``LD_PRELOAD`` (it runs in a separate process group via
+    # process substitution), so wrapping it with ``stdbuf`` is safe and
+    # still useful for line-buffered merged-log output.
     if _has_stdbuf:
         sed_prefix = f"stdbuf -oL sed 's/^/{log_prefix}/'"
     else:

@@ -16,6 +16,18 @@ from __future__ import annotations
 
 import logging as stdlib_logging
 
+# IMPORTANT: scrub ``LD_PRELOAD`` BEFORE importing anything that might
+# touch ``torch_memory_saver``. Some launchers (e.g. ``stdbuf -oL``)
+# concatenate their own preload hook onto our TMS shim using ``:`` as
+# the separator; on systems whose ``ld.so`` does not split on ``:``,
+# downstream ``dlopen(os.environ['LD_PRELOAD'])`` calls fail with
+# ``cannot open shared object file``. The scrub keeps only the TMS
+# entry that the dynamic linker has already loaded at process start, so
+# it is a no-op when TMS is not enabled for this worker.
+from areal.utils.offload import scrub_ld_preload_for_tms
+
+scrub_ld_preload_for_tms()
+
 from areal.infra.rpc.guard.app import (
     GuardState,
     configure_state_from_args,

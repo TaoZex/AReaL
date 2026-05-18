@@ -175,4 +175,34 @@ class RLVRWorkflow(RolloutWorkflow):
             "attention_mask": torch.ones(len(seq), dtype=torch.bool),
             "rewards": torch.tensor(reward, dtype=torch.float32),
         }
-        return {k: v.unsqueeze(0) for k, v in res.items()}
+        out = {k: v.unsqueeze(0) for k, v in res.items()}
+        # Propagate the optional ``data_source`` routing field so that
+        # Multi-teacher On-Policy Distillation (MoPD) — which reads
+        # ``traj[teacher_key]`` (default ``"data_source"``) — can route
+        # this trajectory to the correct teacher engine, AND so that
+        # downstream actor stats can split metrics (task_reward, correct
+        # counts, sample counts) per data source.
+        #
+        # IMPORTANT: store as a *single-element list* rather than a plain
+        # string. ``concat_padded_tensors`` (areal/utils/data.py:286-296)
+        # has three branches per key:
+        #   * tensor → ``_pad_cat_dim0``,
+        #   * list   → ``[item for v in values for item in v]`` (correct
+        #              per-trajectory concat),
+        #   * else   → ``values[0]`` (silent collapse to traj[0]'s value!).
+        # A bare string would hit the else-branch and the entire
+        # mini-batch would inherit traj[0]'s data_source — which is
+        # exactly what we need to avoid for per-source stats. Wrapping
+        # in a list keeps every traj's routing key alive through concat.
+        # The trainer's ``group_trajectories_by_teacher`` reads each
+        # traj *before* concat (operating on the per-traj dicts), so
+        # the list wrapping is transparent to MoPD routing — see
+        # ``resolve_teacher_key`` in mopd_utils.py which simply does
+        # ``sample[teacher_key]`` and treats the value as opaque.
+        # ``group_trajectories_by_teacher`` happens to compare via ==
+        # so a single-element list compares unequal to the bare string;
+        # we therefore unwrap it back to a string for the trainer's
+        # per-traj view (the list form is only needed *after* concat).
+        if isinstance(data, dict) and "data_source" in data:
+            out["data_source"] = [data["data_source"]]
+        return out

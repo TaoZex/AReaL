@@ -14,6 +14,7 @@ if TYPE_CHECKING:
 
 VALID_DATASETS = [
     "gsm8k",
+    "gsm8k_torl",
     "clevr_count_70k",
     "geometry3k",
     "virl39k",
@@ -33,7 +34,21 @@ def _get_custom_dataset(
     processor: Optional["ProcessorMixin"] = None,
     **kwargs,
 ) -> "Dataset":
-    if "gsm8k" in path and type == "sft":
+    if "gsm8k_torl" in path and type == "rl":
+        # Combined GSM8K + ToRL loader for "two physically separate
+        # text-only math datasets" Multi-teacher On-Policy Distillation
+        # (MoPD). MUST be matched *before* the plain ``gsm8k`` branch
+        # because ``"gsm8k" in "gsm8k_torl"`` is also True.
+        from .gsm8k_torl import get_gsm8k_torl_rl_dataset
+
+        return get_gsm8k_torl_rl_dataset(
+            path=path,
+            split=split,
+            tokenizer=tokenizer,
+            max_length=max_length,
+            **kwargs,
+        )
+    elif "gsm8k" in path and type == "sft":
         from .gsm8k import get_gsm8k_sft_dataset
 
         return get_gsm8k_sft_dataset(
@@ -187,6 +202,13 @@ def get_custom_dataset(
         )
 
     if dataset_config is not None:
+        # ``dataset_kwargs`` is the OmegaConf-friendly hook for passing
+        # loader-specific options (e.g. MoPD's ``data_source_split``) from
+        # YAML through to the underlying ``get_*_rl_dataset`` function.
+        # Merge it on top of explicit ``**kwargs`` so call-site overrides
+        # win deterministically.
+        merged_kwargs = dict(getattr(dataset_config, "dataset_kwargs", None) or {})
+        merged_kwargs.update(kwargs)
         return _get_custom_dataset(
             path=dataset_config.path,
             type=dataset_config.type,
@@ -194,7 +216,7 @@ def get_custom_dataset(
             max_length=dataset_config.max_length,
             tokenizer=tokenizer,
             processor=processor,
-            **kwargs,
+            **merged_kwargs,
         )
 
     logger.warning("dataset_config is not provided")

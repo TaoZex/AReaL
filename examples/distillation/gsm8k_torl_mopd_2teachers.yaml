@@ -1,0 +1,337 @@
+## Example: TWO-DATASET TWO-TEACHER Multi-teacher On-Policy Distillation
+## (MoPD) — physically separate datasets routed to distinct teachers.
+##
+## Unlike ``gsm8k_grpo_mopd_2teachers.yaml`` which splits a *single*
+## GSM8K dataset by sample-index parity, this config wires up two
+## *independent* text-only math datasets:
+##
+##   * ``openai/gsm8k``  (grade-school word problems, easy/medium)
+##   * ``torl_data``      (mixed MATH / AIME / Olympiad problems, harder)
+##
+## Both go through ``RLVRWorkflow`` (text-only) so the student can stay
+## a small text LLM. Geometry3K was deliberately *not* used because it
+## is a vision dataset and would force the student to a VLM.
+##
+## ----------------------------------------------------------------------
+## Why this design
+## ----------------------------------------------------------------------
+## The single-dataset-split example shows MoPD routing works at N=2 with
+## one upstream dataset. This example complements it by exercising the
+## "two truly independent loaders concatenated upstream" path:
+##
+##   * the combined loader ``get_gsm8k_torl_rl_dataset`` calls each
+##     sub-loader, projects both onto a shared ``{messages, answer}``
+##     schema, stamps a uniform ``data_source`` per side, and only then
+##     calls ``datasets.concatenate_datasets`` so feature dicts agree;
+##   * downstream MoPD reads ``traj["data_source"]`` and dispatches each
+##     trajectory to the matching teacher;
+##   * a single ``gsm8k_reward_fn`` works for both sides because the
+##     answer schema (``\boxed{...}`` or ``"#### N"``) is parsed by the
+##     same ``math_verify`` pipeline.
+##
+## ----------------------------------------------------------------------
+## Routing & teacher matching
+## ----------------------------------------------------------------------
+## ``teacher_key`` is "data_source"; each row carries one of:
+##   * "openai/gsm8k" -> teacher ``gsm8k_teacher`` (Qwen2.5-7B-Instruct,
+##                                                  general 7B; GSM8K is
+##                                                  easy enough that a
+##                                                  general instruct
+##                                                  model already
+##                                                  produces dense,
+##                                                  high-quality teacher
+##                                                  trajectories)
+##   * "torl_math"    -> teacher ``torl_teacher``  (Qwen2.5-Math-7B-Instruct,
+##                                                  math-specialised 7B;
+##                                                  ToRL spans MATH/AIME/
+##                                                  Olympiad where the
+##                                                  math model
+##                                                  substantially
+##                                                  outperforms the
+##                                                  general one, giving
+##                                                  the student stronger
+##                                                  shaping on hard
+##                                                  problems)
+##
+## Both teachers carry identical ``rl_loss_weight`` and
+## ``distill_loss_weight`` so ``teachers_share_uniform_weights`` returns
+## True and we recover verl's "single ppo_update per global step"
+## semantics — the multi-teacher fanout happens only at ``compute_logp``.
+##
+## Rollout backend: SGLang (see ``rollout.backend`` and the ``sglang:``
+## block below). To swap back to vLLM, change ``rollout.backend`` to
+## ``"vllm:d1p1t1"`` — the ``vllm:`` block is kept for that purpose.
+##
+## ----------------------------------------------------------------------
+## What to watch on wandb
+## ----------------------------------------------------------------------
+## TWO non-zero counters with shares proportional to dataset sizes
+## (GSM8K-train ≈ 7,473 rows, ToRL-train ≈ 1,275 rows; ratio ~85/15):
+##   mopd/gsm8k_teacher_routed_samples ~= 0.85 * batch_size * n_samples
+##   mopd/torl_teacher_routed_samples  ~= 0.15 * batch_size * n_samples
+## together with non-trivial actor/rkl_loss (k3 reverse-KL).
+##
+## If either counter sits at 0, routing is broken upstream
+## (``data_source`` not propagated through the workflow).
+
+experiment_name: gsm8k-torl-mopd-2teachers
+trial_name: trial0
+
+seed: 1
+enable_offload: true
+total_train_epochs: 5
+tokenizer_path: ${actor.path}
+
+cluster:
+  n_nodes: 1
+  n_gpus_per_node: 8
+  fileroot: /tmp/areal/experiments
+  name_resolve:
+    type: nfs
+    nfs_record_root: /tmp/areal/name_resolve
+
+scheduler:
+  type: null
+
+rollout:
+  # SGLang rollout backend. Block ``sglang:`` below carries the engine
+  # config (mem_fraction_static / context_length / dtype). The ``vllm:``
+  # block has been removed from this config to keep things unambiguous.
+  backend: "sglang:d1p1t1"
+  experiment_name: ${experiment_name}
+  trial_name: ${trial_name}
+  max_concurrent_rollouts: 256
+  queue_size: null
+  consumer_batch_size: ${train_dataset.batch_size}
+  max_head_offpolicyness: 2
+  enable_rollout_tracing: false
+  scheduling_spec: ${actor.scheduling_spec}
+  fileroot: ${cluster.fileroot}
+  tokenizer_path: ${tokenizer_path}
+  dump_to_file: true
+
+gconfig:
+  n_samples: 4
+  min_new_tokens: 0
+  max_new_tokens: 2048
+  greedy: false
+  temperature: 1.0
+
+actor:
+  backend: "fsdp:d1p1t1"
+  experiment_name: ${experiment_name}
+  trial_name: ${trial_name}
+  path: /workspace/models/Qwen3-0.6B
+  init_from_scratch: false
+  disable_dropout: true
+  gradient_checkpointing: true
+  dtype: bfloat16
+  mb_spec:
+    max_tokens_per_mb: 10240
+  optimizer:
+    type: adam
+    lr: 1.70e-5
+    weight_decay: 0.017
+    beta1: 0.9
+    beta2: 0.999
+    eps: 1e-8
+    lr_scheduler_type: constant
+    gradient_clipping: 1.0
+    warmup_steps_proportion: 0.001
+  eps_clip: 0.4
+  temperature: ${gconfig.temperature}
+  reward_scaling: 10.0
+  reward_bias: -0.5
+  kl_ctl: 0.0
+  ppo_n_minibatches: 1
+  recompute_logprob: true
+  use_decoupled_loss: true
+  rejection_sampling:
+    metric: ratio
+    upper: 5.0
+  reward_norm:
+    mean_level: group
+    std_level: group
+    group_size: ${gconfig.n_samples}
+  adv_norm:
+    mean_level: batch
+    std_level: batch
+  weight_update_mode: xccl
+  max_new_tokens: ${gconfig.max_new_tokens}
+  scheduling_spec:
+    - task_type: worker
+      port_count: 2
+      gpu: 1
+      mem: 32
+      cmd: python3 -m areal.infra.rpc.rpc_server
+      env_vars: {}
+
+# ----- Multi-teacher On-Policy Distillation (MoPD) -------------------
+# Two teachers, each receiving its own physical dataset stream via
+# ``data_source`` routing. Both teachers carry identical
+# ``rl_loss_weight`` and ``distill_loss_weight`` to keep
+# ``teachers_share_uniform_weights`` True (single ppo_update / step).
+
+teacher_key: data_source
+
+teachers:
+  # Teacher-to-dataset pairing rationale:
+  #   * GSM8K is grade-school arithmetic; a *general* 7B instruct model
+  #     already solves it competently, so the distillation signal is
+  #     dense and well-distributed across the response space.
+  #   * ToRL mixes MATH / AIME / Olympiad problems where a *math-
+  #     specialised* 7B substantially outperforms the general one, so
+  #     handing ToRL rows to the math model produces higher-quality
+  #     teacher trajectories for the student to imitate.
+  # Pairing the strong-on-easy / strong-on-hard models with the matching
+  # difficulty band maximises the per-token shaping that MoPD provides.
+  gsm8k_teacher:
+    backend: "fsdp:d1p1t2"
+    key: "openai/gsm8k"
+    rl_loss_weight: 1.0
+    distill_loss_weight: 0.005
+    experiment_name: ${experiment_name}
+    trial_name: ${trial_name}
+    path: /workspace/models/Qwen2.5-7B-Instruct
+    init_from_scratch: false
+    disable_dropout: true
+    dtype: ${actor.dtype}
+    offload: true
+    mb_spec:
+      max_tokens_per_mb: 10240
+    optimizer: null
+    scheduling_spec: ${actor.scheduling_spec}
+  torl_teacher:
+    backend: "fsdp:d1p1t2"
+    key: "torl_math"
+    rl_loss_weight: 1.0
+    distill_loss_weight: 0.005
+    experiment_name: ${experiment_name}
+    trial_name: ${trial_name}
+    path: /workspace/models/Qwen2.5-Math-7B-Instruct
+    init_from_scratch: false
+    disable_dropout: true
+    dtype: ${actor.dtype}
+    offload: true
+    mb_spec:
+      max_tokens_per_mb: 10240
+    optimizer: null
+    scheduling_spec: ${actor.scheduling_spec}
+
+ref:
+  backend: ${actor.backend}
+  experiment_name: ${experiment_name}
+  trial_name: ${trial_name}
+  path: ${actor.path}
+  init_from_scratch: false
+  disable_dropout: true
+  dtype: ${actor.dtype}
+  mb_spec:
+    max_tokens_per_mb: 10240
+  optimizer: null
+  scheduling_strategy:
+    type: colocation
+    target: actor
+  scheduling_spec: ${actor.scheduling_spec}
+
+# SGLang
+sglang:
+  model_path: ${actor.path}
+  random_seed: ${seed}
+  skip_tokenizer_init: true
+  dtype: ${actor.dtype}
+  max_running_requests: null
+  context_length: 32768
+  mem_fraction_static: 0.8
+
+# ``vllm:`` block kept for parity with other example YAMLs and so the
+# config can be flipped back to vLLM by changing only ``rollout.backend``.
+# The currently-active backend is sglang above.
+vllm:
+  model: ${actor.path}
+  seed: ${seed}
+  skip_tokenizer_init: false
+  dtype: ${actor.dtype}
+  max_model_len: 32768
+  gpu_memory_utilization: 0.8
+
+train_dataset:
+  batch_size: 256
+  shuffle: true
+  pin_memory: true
+  num_workers: 4
+  # ``path`` is interpreted by the dispatcher in ``areal/dataset/__init__.py``
+  # as a *selector* for the combined GSM8K+ToRL loader — the matched
+  # branch ignores ``path`` itself and uses ``gsm8k_path``/``torl_path``
+  # passed via ``dataset_kwargs`` (or their built-in defaults).
+  path: gsm8k_torl
+  type: rl
+  max_length: 1024
+  # ``dataset_kwargs`` is forwarded verbatim to the loader. The two
+  # routing keys here must match the ``key`` of the corresponding
+  # ``teachers.*`` entry above.
+  dataset_kwargs:
+    gsm8k_path: openai/gsm8k
+    torl_path: /tmp/areal/torl_data/train.parquet
+    gsm8k_split: train
+    torl_split: train
+    gsm8k_key: "openai/gsm8k"
+    torl_key: "torl_math"
+
+valid_dataset:
+  batch_size: 256
+  pin_memory: true
+  num_workers: 4
+  # ToRL ships only a ``test.parquet``; reuse the combined loader on the
+  # validation streams so both routing keys are still represented and
+  # downstream evaluator behaves consistently. MoPD fanout is *not*
+  # active during eval — ``data_source`` is ignored there.
+  path: gsm8k_torl
+  type: rl
+  dataset_kwargs:
+    gsm8k_path: openai/gsm8k
+    torl_path: /tmp/areal/torl_data/test.parquet
+    gsm8k_split: test
+    torl_split: test
+    gsm8k_key: "openai/gsm8k"
+    torl_key: "torl_math"
+
+saver:
+  experiment_name: ${experiment_name}
+  trial_name: ${trial_name}
+  fileroot: ${cluster.fileroot}
+  freq_epochs: 1
+  freq_steps: null
+  freq_secs: null
+
+recover:
+  mode: disabled
+  experiment_name: ${experiment_name}
+  trial_name: ${trial_name}
+  fileroot: ${cluster.fileroot}
+  freq_epochs: 1
+  freq_steps: null
+  freq_secs: 3600
+
+evaluator:
+  experiment_name: ${experiment_name}
+  trial_name: ${trial_name}
+  fileroot: ${cluster.fileroot}
+  freq_epochs: 1
+  freq_steps: null
+  freq_secs: null
+
+stats_logger:
+  experiment_name: ${experiment_name}
+  trial_name: ${trial_name}
+  fileroot: ${cluster.fileroot}
+  wandb:
+    mode: disabled
+
+perf_tracer:
+  experiment_name: ${experiment_name}
+  trial_name: ${trial_name}
+  fileroot: ${cluster.fileroot}
+  enabled: false
+  session_tracer:
+    enabled: false

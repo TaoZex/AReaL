@@ -2835,6 +2835,24 @@ class TeacherConfig(PPOActorConfig):
         metadata={"help": "Distillation loss weight"},
     )
 
+    # ----- Multi-teacher On-Policy Distillation (MoPD) -----------------
+    # Routing identifier consumed by the MoPD adapter. Mirrors verl's
+    # ``DistillationTeacherModelConfig.key`` field.  Optional in the
+    # single-teacher path (where it is ignored); required when this
+    # teacher is one entry of ``PPOConfig.teachers``.
+    key: str | None = field(
+        default=None,
+        metadata={
+            "help": (
+                "Routing identifier for multi-teacher OPD (MoPD). When "
+                "this TeacherConfig is part of PPOConfig.teachers, the "
+                "value of sample[teacher_key] must match this `key` to "
+                "be routed to this teacher. Ignored for the legacy "
+                "single-teacher PPOConfig.teacher path."
+            )
+        },
+    )
+
 
 @dataclass
 class PPOConfig(BaseExperimentConfig):
@@ -2864,6 +2882,35 @@ class PPOConfig(BaseExperimentConfig):
             )
         },
     )
+    # ----- Multi-teacher On-Policy Distillation (MoPD) -----------------
+    # When this dict is non-empty, AReaL spins up one teacher engine
+    # per entry and routes each rollout sample to the matching teacher
+    # using ``teacher_key`` (mirrors verl's distillation.teacher_models).
+    # Leave it as ``None`` (or empty) to preserve the legacy
+    # single-teacher path driven by ``PPOConfig.teacher``.
+    teachers: dict[str, TeacherConfig] | None = field(
+        default=None,
+        metadata={
+            "help": (
+                "Optional mapping of teacher-name -> TeacherConfig for "
+                "multi-teacher on-policy distillation (MoPD). Each "
+                "entry's `key` field is matched against sample[teacher_key]. "
+                "If set, takes precedence over `teacher`. None (or empty) "
+                "preserves the original single-teacher behaviour."
+            )
+        },
+    )
+    teacher_key: str = field(
+        default="data_source",
+        metadata={
+            "help": (
+                "Field on each rollout trajectory used to route the "
+                "sample to the correct teacher in multi-teacher OPD. "
+                "Mirrors verl's distillation.teacher_key default of "
+                "'data_source'. Ignored unless `teachers` is set."
+            )
+        },
+    )
     dynamic_bs: bool = field(
         default=False,
         metadata={
@@ -2877,6 +2924,22 @@ class PPOConfig(BaseExperimentConfig):
         """Validate the eval generation config."""
         if self.eval_gconfig is None:
             self.eval_gconfig = self.gconfig.new()
+        # ----- MoPD validation ---------------------------------------
+        # Reject ambiguous configurations where both the legacy single
+        # teacher and the new ``teachers`` mapping are populated.
+        if self.teachers is not None and len(self.teachers) > 0 and self.teacher is not None:
+            raise ValueError(
+                "[MoPD] PPOConfig.teacher and PPOConfig.teachers are mutually "
+                "exclusive. Use `teacher` for single-teacher OPD or `teachers` "
+                "for multi-teacher OPD, but not both."
+            )
+        if self.teachers is not None:
+            for name, t_cfg in self.teachers.items():
+                if t_cfg is None:
+                    raise ValueError(
+                        f"[MoPD] PPOConfig.teachers entry {name!r} is None; "
+                        "remove the entry or supply a TeacherConfig."
+                    )
         super().__post_init__()
 
 

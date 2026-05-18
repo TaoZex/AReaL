@@ -58,8 +58,14 @@ $$J_{KDRL}(\theta) = J_{GRPO}(\theta) - \beta D_{KL}(\pi_\theta \parallel
 $\nabla_\theta J_{KDRL}(\theta)$ 是 $\nabla_\theta J_{GRPO}( \theta) + \beta
 \cdot \nabla_\theta J_{RKL}(\theta)$ 的无偏估计。
 
-- 实现细节：在联合损失场景（`rl_loss_weight` > 0）中，RKL 作为直接正则项。最小化 `logprobs - teacher_logp`，在学生分布
-  $\pi_\theta$ 采样下与最小化 $D_{KL}(\pi_\theta \parallel \pi_T)$ 等价。代码实现为：
+- 实现细节：在联合损失场景（`rl_loss_weight` > 0）中，RKL 作为直接正则项。我们采用
+  Schulman 的 k3 无偏 RKL 估计量
+  `exp(teacher_logp - logprobs) - (teacher_logp - logprobs) - 1`，而非朴素的
+  `logprobs - teacher_logp`(k1)。原因是 `teacher_logp` 在实现中已被 `.detach()`，
+  此时 k1 项关于 θ 的梯度退化为 `grad(logprobs)`，与 teacher 取值无关，等价于
+  均匀负熵正则、不再具备蒸馏语义；而 k3 始终非负，期望与真实 KL 一致，且其梯度
+  `(1 - exp(teacher_logp - logprobs)) * grad(logprobs)` 显式依赖 teacher_logp，
+  恢复真正的师生对齐信号。代码实现为：
   `loss = rl_loss_weight * loss + distill_loss_weight * rkl_penalty`
 
 ## 运行示例

@@ -153,7 +153,7 @@ class VisionRLVRWorkflow(RLVRWorkflow):
         if "image_grid_thw" in processed_input:
             multi_modal_input[0]["image_grid_thw"] = processed_input["image_grid_thw"]
 
-        return {
+        out: dict[str, Any] = {
             "input_ids": torch.tensor(seq, dtype=torch.long).unsqueeze(0),
             "mm_token_type_ids": torch.tensor(
                 mm_token_type_ids, dtype=torch.long
@@ -165,3 +165,20 @@ class VisionRLVRWorkflow(RLVRWorkflow):
             "attention_mask": torch.ones(len(seq), dtype=torch.bool).unsqueeze(0),
             "rewards": torch.tensor(reward, dtype=torch.float32).unsqueeze(0),
         }
+        # Propagate the optional ``data_source`` routing field so that
+        # Multi-teacher On-Policy Distillation (MoPD) can route this
+        # VLM trajectory to the correct teacher engine. Mirrors the
+        # equivalent propagation in ``RLVRWorkflow.arun_episode``;
+        # without this, any VLM dataset (e.g. geometry3k) routed
+        # through MoPD would crash inside
+        # ``group_trajectories_by_teacher`` with a missing-key error.
+        # Stored as a *single-element list* (not a bare string) so
+        # ``concat_padded_tensors`` preserves every traj's value via
+        # its list-branch (areal/utils/data.py:286-296). The else-branch
+        # would otherwise collapse the entire mini-batch to traj[0]'s
+        # value, breaking downstream per-source stats. The trainer's
+        # ``resolve_teacher_key`` unwraps the list back to a string.
+        # When MoPD is disabled, downstream code simply ignores it.
+        if isinstance(data, dict) and "data_source" in data:
+            out["data_source"] = [data["data_source"]]
+        return out

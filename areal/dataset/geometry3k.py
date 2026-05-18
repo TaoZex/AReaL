@@ -127,8 +127,18 @@ def get_geometry3k_rl_dataset(
     split: str,
     processor,
     max_length: int | None = None,
+    data_source: str | None = None,
 ):
+    """Load Geometry3K as an RL dataset.
+
+    ``data_source`` (optional) stamps every sample with a routing identifier
+    used by Multi-teacher On-Policy Distillation (MoPD) — see
+    ``PPOConfig.teacher_key`` / ``PPOConfig.teachers``. Defaults to ``path``
+    so the column is always populated and downstream RLVRWorkflow can
+    propagate it onto each rollout trajectory unchanged.
+    """
     dataset = load_dataset(path=path, split=split)
+    routing_key = data_source if data_source is not None else path
 
     def process(sample):
         processed_images = [
@@ -182,6 +192,9 @@ def get_geometry3k_rl_dataset(
             "messages": messages,
             "messages_chat": messages_chat,
             "images": processed_images,
+            # ``data_source`` is the canonical routing field for MoPD.
+            # When MoPD is disabled, downstream code simply ignores it.
+            "data_source": routing_key,
         }
 
     dataset = dataset.map(process).remove_columns(["problem"])
